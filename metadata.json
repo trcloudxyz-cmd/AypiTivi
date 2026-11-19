@@ -1,5 +1,5 @@
 {
-  "name": "Akış IPTV",
+  "name": "AyPi TiVi",
   "description": "Modern karanlık modda M3U/M3U8 destekli, Canlı TV, Film ve Dizi kategorili IPTV oynatıcı.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
