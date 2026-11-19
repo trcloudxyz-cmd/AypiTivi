@@ -1,7 +1,13 @@
 import {CheckCircle2, FileText, Link2, Sparkles, Upload, X} from 'lucide-react';
 import {useRef, useState} from 'react';
 import type {Playlist} from '../types/iptv';
-import {computePlaylistStats, createSamplePlaylist, parseM3U} from '../utils/m3uParser';
+import {
+  computePlaylistStats,
+  createDirectStreamItem,
+  createSamplePlaylist,
+  isHlsStreamManifest,
+  parseM3U,
+} from '../utils/m3uParser';
 
 interface UploadPanelProps {
   onImportPlaylist: (playlist: Playlist) => void;
@@ -10,6 +16,8 @@ interface UploadPanelProps {
 }
 
 type ImportTab = 'file' | 'url' | 'paste';
+
+const LOCAL_VIDEO_EXTENSIONS = ['.ts', '.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
 
 export function UploadPanel({onImportPlaylist, onClose, isModal = false}: UploadPanelProps) {
   const [activeTab, setActiveTab] = useState<ImportTab>('file');
@@ -23,18 +31,12 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const processM3uContent = (
-    rawContent: string,
+  const buildPendingPlaylist = (
+    items: Playlist['items'],
     defaultName: string,
     sourceType: Playlist['sourceType'],
     sourceRef?: string,
   ) => {
-    setError(null);
-    const items = parseM3U(rawContent);
-    if (items.length === 0) {
-      setError('Geçerli bir kanal veya yayın akışı bulunamadı. Dosyanın M3U/M3U8 formatında olduğundan emin olun.');
-      return;
-    }
     const finalName = playlistName.trim() || defaultName;
     const playlist: Playlist = {
       id: `pl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -50,25 +52,27 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     }
   };
 
-  const handleFile = async (file: File) => {
+  const processM3uContent = (
+    rawContent: string,
+    defaultName: string,
+    sourceType: Playlist['sourceType'],
+    sourceRef?: string,
+  ) => {
     setError(null);
-    setIsLoading(true);
-    try {
-      const text = await file.text();
-      const baseName = file.name.replace(/\.(m3u8?|txt)$/i, '') || 'M3U Listem';
-      processM3uContent(text, baseName, 'file', file.name);
-    } catch {
-      setError('Dosya okunurken bir hata oluştu.');
-    } finally {
-      setIsLoading(false);
+    const items = parseM3U(rawContent);
+    if (items.length === 0) {
+      setError(
+        'Geçerli bir kanal veya yayın bağlantısı bulunamadı. M3U/M3U8 içeriği veya doğrudan yayın linki (.m3u, .m3u8, .ts) girin.',
+      );
+      return;
     }
+    buildPendingPlaylist(items, defaultName, sourceType, sourceRef);
   };
 
-  const handleUrlFetch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmed = urlInput.trim();
+  const fetchOrAddUrl = async (rawUrl: string) => {
+    const trimmed = rawUrl.trim();
     if (!trimmed) {
-      setError('Lütfen geçerli bir M3U veya M3U8 bağlantısı girin.');
+      setError('Lütfen geçerli bir M3U, M3U8 veya TS bağlantısı girin.');
       return;
     }
 
@@ -80,32 +84,95 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({url: trimmed}),
       });
-      const data = (await response.json()) as {content?: string; error?: string};
-      if (!response.ok || !data.content) {
-        throw new Error(data.error || 'Liste indirilemedi.');
+      const data = (await response.json()) as {
+        isDirectStream?: boolean;
+        content?: string;
+        finalUrl?: string;
+        error?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Bağlantı yüklenemedi.');
       }
-      let derivedName = 'URL Yayın Listesi';
+
+      let derivedName = 'Yayın Bağlantısı';
       try {
         const parsedUrl = new URL(trimmed);
         derivedName = parsedUrl.hostname.replace(/^www\./, '');
       } catch {
         // Fallback name
       }
-      processM3uContent(data.content, derivedName, 'url', trimmed);
+
+      if (data.isDirectStream) {
+        const item = createDirectStreamItem(data.finalUrl || trimmed, playlistName.trim() || undefined);
+        buildPendingPlaylist([item], item.name, 'url', trimmed);
+        return;
+      }
+
+      const content = data.content || '';
+      if (isHlsStreamManifest(content)) {
+        const item = createDirectStreamItem(data.finalUrl || trimmed, playlistName.trim() || undefined);
+        buildPendingPlaylist([item], item.name, 'url', trimmed);
+        return;
+      }
+
+      processM3uContent(content, derivedName, 'url', trimmed);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Bağlantıdan liste yüklenemedi.');
+      setError(err instanceof Error ? err.message : 'Bağlantıdan içerik yüklenemedi.');
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handlePasteSubmit = (e: React.FormEvent) => {
+  const handleFile = async (file: File) => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const lowerName = file.name.toLowerCase();
+      const baseName =
+        file.name.replace(/\.(m3u8?|ts|mp4|mkv|webm|avi|mov|m4v|txt)$/i, '') || 'Yayın Listem';
+
+      if (LOCAL_VIDEO_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
+        const objectUrl = URL.createObjectURL(file);
+        const streamFormat = lowerName.endsWith('.ts') ? 'mpegts' : 'native';
+        const item = createDirectStreamItem(objectUrl, baseName, 1, streamFormat);
+        buildPendingPlaylist([item], baseName, 'file', file.name);
+        return;
+      }
+
+      const text = await file.text();
+      processM3uContent(text, baseName, 'file', file.name);
+    } catch {
+      setError('Dosya okunurken bir hata oluştu.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleUrlFetch = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!pasteInput.trim()) {
-      setError('Lütfen M3U içeriğini yapıştırın.');
+    await fetchOrAddUrl(urlInput);
+  };
+
+  const handlePasteSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = pasteInput.trim();
+    if (!trimmed) {
+      setError('Lütfen M3U içeriğini veya yayın linkini (.m3u, .m3u8, .ts) yapıştırın.');
       return;
     }
-    processM3uContent(pasteInput, 'Özel Yayın Listesi', 'paste');
+
+    // If user pasted a single URL (e.g., https://.../playlist.m3u or https://.../stream.ts), handle it smartly
+    const nonEmptyLines = trimmed
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (nonEmptyLines.length === 1 && /^https?:\/\/\S+$/i.test(nonEmptyLines[0])) {
+      await fetchOrAddUrl(nonEmptyLines[0]);
+      return;
+    }
+
+    processM3uContent(trimmed, 'Özel Yayın Listesi', 'paste');
   };
 
   const handleConfirmPending = () => {
@@ -131,10 +198,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="font-display text-xl font-semibold tracking-tight text-white sm:text-2xl">
-            M3U Yayın Listesi Yükle
+            Yayın Listesi veya Link Ekle
           </h2>
           <p className="mt-1.5 text-sm text-slate-400">
-            M3U veya M3U8 dosyanızı sürükleyip bırakın, bağlantı adresiyle çekin ya da içeriği yapıştırın.
+            M3U/M3U8/TS dosyanızı yükleyin, doğrudan dosya/yayın bağlantısını yapıştırın ya da içerik listesini ekleyin.
           </p>
         </div>
         {isModal && onClose && (
@@ -181,7 +248,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
           }`}
         >
           <Link2 size={15} />
-          <span>URL Bağlantısı</span>
+          <span>Link Yapıştır (.m3u / .ts)</span>
         </button>
         <button
           type="button"
@@ -197,21 +264,21 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
           }`}
         >
           <FileText size={15} />
-          <span>Metin Yapıştır</span>
+          <span>Çoklu Link / Metin</span>
         </button>
       </div>
 
       {/* Optional Playlist Name */}
       <div className="mt-5">
         <label htmlFor="playlist-name-input" className="block text-xs font-medium text-slate-300">
-          Liste Adı (İsteğe Bağlı)
+          Liste veya Yayın Adı (İsteğe Bağlı)
         </label>
         <input
           id="playlist-name-input"
           type="text"
           value={playlistName}
           onChange={(e) => setPlaylistName(e.target.value)}
-          placeholder="Örn: Ev TV Listem"
+          placeholder="Örn: Ev TV Listem veya Haber HD"
           className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 text-sm text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
         />
       </div>
@@ -248,7 +315,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
           <input
             ref={fileInputRef}
             type="file"
-            accept=".m3u,.m3u8,.txt,audio/x-mpegurl,application/vnd.apple.mpegurl"
+            accept=".m3u,.m3u8,.ts,.mp4,.mkv,.webm,.txt,audio/x-mpegurl,application/vnd.apple.mpegurl,video/mp2t,video/*"
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
@@ -259,10 +326,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             <Upload size={22} />
           </div>
           <p className="mt-4 text-sm font-medium text-white">
-            {isLoading ? 'Dosya ayrıştırılıyor...' : 'M3U dosyasını buraya sürükleyin veya seçin'}
+            {isLoading ? 'Dosya ayrıştırılıyor...' : 'M3U, M3U8 veya TS dosyasını buraya sürükleyin veya seçin'}
           </p>
           <p className="mt-1 text-xs text-slate-400">
-            Desteklenen formatlar: .m3u, .m3u8, .txt · Tamamı tarayıcıda işlenir
+            Desteklenen formatlar: .m3u, .m3u8, .ts, .mp4 (isteğe bağlı .txt)
           </p>
         </div>
       )}
@@ -271,24 +338,27 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         <form onSubmit={handleUrlFetch} className="mt-5 space-y-4">
           <div>
             <label htmlFor="m3u-url-input" className="block text-xs font-medium text-slate-300">
-              M3U / M3U8 Bağlantı Adresi
+              M3U, M3U8 veya TS Dosya Linki
             </label>
             <input
               id="m3u-url-input"
               type="url"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="https://ornek.com/playlist.m3u8"
+              placeholder="https://ornek.com/liste.m3u veya https://ornek.com/yayin.ts"
               required
               className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 font-mono text-xs text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none sm:text-sm"
             />
+            <p className="mt-1.5 text-xs text-slate-500">
+              Hem .m3u / .m3u8 liste linklerini hem de doğrudan .ts / .mp4 yayın bağlantılarını destekler.
+            </p>
           </div>
           <button
             type="submit"
             disabled={isLoading}
             className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
           >
-            {isLoading ? 'İndiriliyor...' : 'Bağlantıdan Yükle'}
+            {isLoading ? 'Yükleniyor...' : 'Linkten Ekle'}
           </button>
         </form>
       )}
@@ -297,22 +367,25 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         <form onSubmit={handlePasteSubmit} className="mt-5 space-y-4">
           <div>
             <label htmlFor="m3u-paste-input" className="block text-xs font-medium text-slate-300">
-              #EXTM3U İçeriği
+              M3U İçeriği veya Doğrudan Yayın Linkleri (.m3u / .m3u8 / .ts)
             </label>
             <textarea
               id="m3u-paste-input"
               rows={6}
               value={pasteInput}
               onChange={(e) => setPasteInput(e.target.value)}
-              placeholder={'#EXTM3U\n#EXTINF:-1 group-title="Haber",Kanal Adı\nhttps://yayin.ornek.com/canli.m3u8'}
+              placeholder={
+                'https://ornek.com/liste.m3u\nveya satır satır yayın linkleri:\nhttps://yayin.ornek.com/kanal1.ts\nhttps://yayin.ornek.com/kanal2.m3u8\nveya #EXTM3U liste içeriği'
+              }
               className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] p-3.5 font-mono text-xs leading-relaxed text-white placeholder:text-slate-600 focus:border-blue-500 focus:outline-none"
             />
           </div>
           <button
             type="submit"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
+            disabled={isLoading}
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
           >
-            İçeriği Ayrıştır
+            {isLoading ? 'İşleniyor...' : 'Listeye Ekle'}
           </button>
         </form>
       )}

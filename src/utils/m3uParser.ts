@@ -194,6 +194,60 @@ function stableHash(input: string): string {
   return (hash >>> 0).toString(36);
 }
 
+function deriveTitleFromUrl(url: string, fallbackIndex: number): string {
+  try {
+    const parsed = new URL(url, 'http://localhost');
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const last = segments[segments.length - 1];
+    if (last) {
+      const cleaned = decodeURIComponent(last)
+        .replace(/\.(m3u8?|ts|mp4|mkv|avi|mov|m4v|webm|flv)$/i, '')
+        .replace(/[_-]+/g, ' ')
+        .trim();
+      if (cleaned) return cleaned;
+    }
+    if (parsed.hostname && parsed.hostname !== 'localhost') {
+      return parsed.hostname.replace(/^www\./, '');
+    }
+  } catch {
+    // Use fallback
+  }
+  return `Kanal ${fallbackIndex}`;
+}
+
+export function isHlsStreamManifest(content: string): boolean {
+  return (
+    /#EXT-X-TARGETDURATION/i.test(content) ||
+    /#EXT-X-MEDIA-SEQUENCE/i.test(content) ||
+    /#EXT-X-STREAM-INF/i.test(content)
+  );
+}
+
+export function createDirectStreamItem(
+  url: string,
+  customName?: string,
+  index = 1,
+  streamFormat?: ChannelItem['streamFormat'],
+): ChannelItem {
+  const name = customName?.trim() || deriveTitleFromUrl(url, index);
+  const group = 'Doğrudan Yayınlar';
+  const mediaType = classifyMediaType(name, group, url);
+  const seriesInfo = mediaType === 'series' ? parseSeriesInfo(name) : {};
+  const qualityLabel = extractQualityLabel(name);
+
+  return {
+    id: `${stableHash(url + name)}_${index}`,
+    index,
+    name,
+    url,
+    group,
+    mediaType,
+    qualityLabel,
+    streamFormat,
+    ...seriesInfo,
+  };
+}
+
 export function parseM3U(content: string): ChannelItem[] {
   const cleaned = content.replace(/^\uFEFF/, '');
   const lines = cleaned.split(/\r?\n/);
@@ -224,8 +278,12 @@ export function parseM3U(content: string): ChannelItem[] {
       continue;
     }
 
-    // Stream URL line
-    if (/^(https?|rtmp|rtsp|udp|mms):\/\//i.test(line) || line.startsWith('/')) {
+    // Stream URL line (or "Channel Name | https://..." shortcut)
+    const pipeMatch = /^(.+?)\s*\|\s*((?:https?|rtmp|rtsp|udp|mms):\/\/\S+)$/i.exec(line);
+    const streamUrl = pipeMatch ? pipeMatch[2].trim() : line;
+    const inlineTitle = pipeMatch ? pipeMatch[1].trim() : '';
+
+    if (/^(https?|rtmp|rtsp|udp|mms):\/\//i.test(streamUrl) || streamUrl.startsWith('/')) {
       const commaIndex = pendingMeta.lastIndexOf(',');
       const attrPart = commaIndex >= 0 ? pendingMeta.slice(0, commaIndex) : pendingMeta;
       const rawTitle = commaIndex >= 0 ? pendingMeta.slice(commaIndex + 1).trim() : '';
@@ -237,17 +295,21 @@ export function parseM3U(content: string): ChannelItem[] {
       const tvgType =
         extractAttribute(attrPart, 'tvg-type') || extractAttribute(attrPart, 'type');
 
-      const name = rawTitle || tvgName || `Kanal ${items.length + 1}`;
+      const name =
+        rawTitle ||
+        inlineTitle ||
+        tvgName ||
+        deriveTitleFromUrl(streamUrl, items.length + 1);
       const group = attrGroup || pendingGroup || 'Genel';
-      const mediaType = classifyMediaType(name, group, line, tvgType);
+      const mediaType = classifyMediaType(name, group, streamUrl, tvgType);
       const seriesInfo = mediaType === 'series' ? parseSeriesInfo(name) : {};
       const qualityLabel = extractQualityLabel(name);
 
       items.push({
-        id: `${stableHash(line + name)}_${items.length}`,
+        id: `${stableHash(streamUrl + name)}_${items.length}`,
         index: items.length + 1,
         name,
-        url: line,
+        url: streamUrl,
         logo: logo || undefined,
         group,
         mediaType,

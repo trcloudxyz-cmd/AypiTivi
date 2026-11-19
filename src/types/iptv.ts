@@ -13,6 +13,7 @@ export interface ChannelItem {
   tvgId?: string;
   tvgName?: string;
   qualityLabel?: string;
+  streamFormat?: 'hls' | 'mpegts' | 'native';
   seriesTitle?: string;
   season?: number;
   episode?: number;

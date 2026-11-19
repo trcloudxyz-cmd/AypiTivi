@@ -85,12 +85,23 @@ async function startServer() {
   const app = express();
   app.use(express.json({limit: '2mb'}));
 
+const DIRECT_STREAM_EXTENSIONS = ['.ts', '.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv'];
+
   // Fetch remote M3U/M3U8 playlist bypassing browser CORS
   app.post('/api/fetch-m3u', async (req, res) => {
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url : '';
     const targetUrl = validateRemoteUrl(rawUrl);
     if (!targetUrl) {
-      res.status(400).json({error: 'Geçerli bir http:// veya https:// M3U bağlantısı girin.'});
+      res.status(400).json({error: 'Geçerli bir http:// veya https:// bağlantısı girin.'});
+      return;
+    }
+
+    const lowerPath = targetUrl.pathname.toLowerCase();
+    if (DIRECT_STREAM_EXTENSIONS.some((ext) => lowerPath.endsWith(ext))) {
+      res.json({
+        isDirectStream: true,
+        finalUrl: targetUrl.toString(),
+      });
       return;
     }
 
@@ -114,6 +125,22 @@ async function startServer() {
         return;
       }
 
+      const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
+      const isMediaBinary =
+        (contentType.startsWith('video/') ||
+          contentType.startsWith('audio/') ||
+          contentType === 'application/octet-stream') &&
+        !contentType.includes('mpegurl');
+
+      if (isMediaBinary) {
+        await upstream.body?.cancel();
+        res.json({
+          isDirectStream: true,
+          finalUrl: upstream.url || targetUrl.toString(),
+        });
+        return;
+      }
+
       const contentLengthHeader = upstream.headers.get('content-length');
       if (contentLengthHeader && Number(contentLengthHeader) > MAX_M3U_BYTES) {
         res.status(413).json({error: 'M3U dosyası 35 MB sınırını aşıyor.'});
@@ -128,6 +155,7 @@ async function startServer() {
 
       const content = new TextDecoder('utf-8').decode(buffer);
       res.json({
+        isDirectStream: false,
         content,
         finalUrl: upstream.url || targetUrl.toString(),
       });
@@ -135,14 +163,14 @@ async function startServer() {
       const message =
         err instanceof Error && err.name === 'AbortError'
           ? 'Bağlantı zaman aşımına uğradı (18 saniye).'
-          : 'M3U bağlantısına erişilemedi. Bağlantıyı ve internet erişimini kontrol edin.';
+          : 'Bağlantıya erişilemedi. Adresi ve internet erişimini kontrol edin.';
       res.status(502).json({error: message});
     } finally {
       clearTimeout(timeout);
     }
   });
 
-  // Optional CORS/mixed-content stream proxy for HLS manifests & media segments
+  // Optional CORS/mixed-content stream proxy for HLS manifests, TS streams, and media segments
   app.get('/api/proxy-stream', async (req, res) => {
     const rawUrl = typeof req.query.url === 'string' ? req.query.url : '';
     const targetUrl = validateRemoteUrl(rawUrl);
@@ -152,7 +180,7 @@ async function startServer() {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    const connectTimeout = setTimeout(() => controller.abort(), 20000);
     req.on('close', () => controller.abort());
 
     try {
@@ -169,6 +197,7 @@ async function startServer() {
         headers,
         redirect: 'follow',
       });
+      clearTimeout(connectTimeout);
 
       if (!upstream.ok && upstream.status !== 206) {
         res.status(upstream.status).send(`Upstream error ${upstream.status}`);
@@ -221,7 +250,7 @@ async function startServer() {
         res.end();
       }
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(connectTimeout);
     }
   });
 

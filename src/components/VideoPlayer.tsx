@@ -1,4 +1,5 @@
 import Hls from 'hls.js';
+import mpegts from 'mpegts.js';
 import {
   AlertTriangle,
   ChevronLeft,
@@ -70,6 +71,7 @@ export function VideoPlayer({
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const mpegtsRef = useRef<mpegts.Player | null>(null);
   const hideControlsTimer = useRef<number | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
@@ -103,7 +105,7 @@ export function VideoPlayer({
     setDuration(0);
   }, [channel?.id]);
 
-  // Attach HLS / Native stream
+  // Attach HLS / MPEG-TS / Native stream
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !channel) return;
@@ -116,6 +118,10 @@ export function VideoPlayer({
       hlsRef.current.destroy();
       hlsRef.current = null;
     }
+    if (mpegtsRef.current) {
+      mpegtsRef.current.destroy();
+      mpegtsRef.current = null;
+    }
 
     const effectiveUrl = useProxy
       ? `/api/proxy-stream?url=${encodeURIComponent(channel.url)}`
@@ -123,11 +129,17 @@ export function VideoPlayer({
 
     const lowerPath = channel.url.split('?')[0].toLowerCase();
     const isDirectVideoFile =
+      channel.streamFormat === 'native' ||
       lowerPath.endsWith('.mp4') ||
       lowerPath.endsWith('.webm') ||
       lowerPath.endsWith('.m4v') ||
       lowerPath.endsWith('.mov') ||
-      lowerPath.endsWith('.ogg');
+      lowerPath.endsWith('.ogg') ||
+      lowerPath.endsWith('.mkv');
+    const isMpegTs =
+      channel.streamFormat === 'mpegts' ||
+      lowerPath.endsWith('.ts') ||
+      lowerPath.endsWith('.flv');
 
     const tryNativePlayback = () => {
       video.src = effectiveUrl;
@@ -138,12 +150,37 @@ export function VideoPlayer({
           if (!cancelled) setIsBuffering(false);
         })
         .catch(() => {
-          // Autoplay might be blocked; user can press play
           if (!cancelled) setIsBuffering(false);
         });
     };
 
-    if (!isDirectVideoFile && Hls.isSupported()) {
+    if (isMpegTs && mpegts.isSupported()) {
+      const player = mpegts.createPlayer({
+        type: lowerPath.endsWith('.flv') ? 'flv' : 'mpegts',
+        isLive: channel.mediaType === 'live',
+        url: effectiveUrl,
+      });
+      mpegtsRef.current = player;
+      player.attachMediaElement(video);
+      player.load();
+      Promise.resolve(player.play())
+        .then(() => {
+          if (!cancelled) setIsBuffering(false);
+        })
+        .catch(() => {
+          if (!cancelled) setIsBuffering(false);
+        });
+
+      player.on(mpegts.Events.ERROR, () => {
+        if (cancelled) return;
+        setIsBuffering(false);
+        setErrorMessage(
+          useProxy
+            ? 'TS yayın akışı proxy üzerinden de açılamadı. Akış çevrimdışı olabilir.'
+            : 'TS yayını açılamadı (CORS veya ağ hatası). Proxy ile oynatmayı deneyebilirsiniz.',
+        );
+      });
+    } else if (!isDirectVideoFile && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: channel.mediaType === 'live',
@@ -185,7 +222,6 @@ export function VideoPlayer({
         if (cancelled) return;
         if (data.fatal) {
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            // If direct URL failed and looks like direct mp4/mkv/ts without m3u8 manifest
             if (isDirectVideoFile) {
               hls.destroy();
               hlsRef.current = null;
@@ -216,6 +252,10 @@ export function VideoPlayer({
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
+      }
+      if (mpegtsRef.current) {
+        mpegtsRef.current.destroy();
+        mpegtsRef.current = null;
       }
       video.removeAttribute('src');
       video.load();
