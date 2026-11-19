@@ -9,6 +9,7 @@ export interface UserPreferences {
   activePlaylistId: string | null;
   favorites: string[];
   recentIds: string[];
+  tvMode?: boolean;
 }
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -77,6 +78,7 @@ export function loadPreferences(): UserPreferences {
       activePlaylistId: parsed.activePlaylistId ?? null,
       favorites: Array.isArray(parsed.favorites) ? parsed.favorites : [],
       recentIds: Array.isArray(parsed.recentIds) ? parsed.recentIds : [],
+      tvMode: typeof parsed.tvMode === 'boolean' ? parsed.tvMode : undefined,
     };
   } catch {
     return {activePlaylistId: null, favorites: [], recentIds: []};

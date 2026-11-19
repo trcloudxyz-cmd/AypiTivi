@@ -22,6 +22,28 @@
   }
 }
 
+/* LG TV / Smart TV D-Pad Focus & Living-Room Legibility */
+html.tv-mode {
+  scroll-padding-top: 88px;
+}
+
+@media (min-width: 1024px) {
+  html.tv-mode {
+    font-size: 17px;
+  }
+}
+
+html.tv-mode button:focus,
+html.tv-mode a:focus,
+html.tv-mode input:focus,
+html.tv-mode select:focus,
+html.tv-mode textarea:focus,
+html.tv-mode [tabindex]:focus {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.3);
+}
+
 /* Custom thin dark scrollbars */
 ::-webkit-scrollbar {
   width: 6px;

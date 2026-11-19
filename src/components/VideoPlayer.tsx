@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import {useCallback, useEffect, useRef, useState} from 'react';
 import type {ChannelItem} from '../types/iptv';
+import {isSmartTvBrowser} from '../utils/tvNavigation';
 
 interface QualityLevel {
   index: number;
@@ -45,6 +46,7 @@ interface VideoPlayerProps {
   hasNext: boolean;
   isTheatreMode: boolean;
   onToggleTheatreMode: () => void;
+  tvMode?: boolean;
 }
 
 function formatTime(seconds: number): string {
@@ -224,6 +226,7 @@ export function VideoPlayer({
   hasNext,
   isTheatreMode,
   onToggleTheatreMode,
+  tvMode = false,
 }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -412,10 +415,11 @@ export function VideoPlayer({
         handleAttemptFailure(httpCode);
       });
     } else if (activeCandidate.mode === 'hls' && Hls.isSupported()) {
+      const smartTv = tvMode || isSmartTvBrowser();
       const hls = new Hls({
-        enableWorker: true,
+        enableWorker: !smartTv,
         lowLatencyMode: channel.mediaType === 'live',
-        backBufferLength: 60,
+        backBufferLength: smartTv ? 30 : 60,
         xhrSetup: useProxy
           ? (xhr) => {
               xhr.withCredentials = true;
@@ -495,13 +499,18 @@ export function VideoPlayer({
     video.muted = isMuted;
   }, [volume, isMuted]);
 
-  // Fullscreen change listener
+  // Fullscreen change listener (standard + webkit for LG webOS)
   useEffect(() => {
     const onFsChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
+      const doc = document as Document & {webkitFullscreenElement?: Element | null};
+      setIsFullscreen(Boolean(document.fullscreenElement || doc.webkitFullscreenElement));
     };
     document.addEventListener('fullscreenchange', onFsChange);
-    return () => document.removeEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+    };
   }, []);
 
   const revealControls = useCallback(() => {
@@ -531,16 +540,40 @@ export function VideoPlayer({
   }, []);
 
   const toggleFullscreen = useCallback(async () => {
-    const el = containerRef.current;
+    const el = containerRef.current as
+      | (HTMLDivElement & {webkitRequestFullscreen?: () => Promise<void> | void})
+      | null;
+    const video = videoRef.current as
+      | (HTMLVideoElement & {webkitEnterFullscreen?: () => void})
+      | null;
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void> | void;
+    };
     if (!el) return;
     try {
-      if (!document.fullscreenElement) {
-        await el.requestFullscreen();
-      } else {
+      const activeFs = document.fullscreenElement || doc.webkitFullscreenElement;
+      if (!activeFs) {
+        if (typeof el.requestFullscreen === 'function') {
+          await el.requestFullscreen();
+        } else if (typeof el.webkitRequestFullscreen === 'function') {
+          await el.webkitRequestFullscreen();
+        } else if (video && typeof video.webkitEnterFullscreen === 'function') {
+          video.webkitEnterFullscreen();
+        }
+      } else if (typeof document.exitFullscreen === 'function') {
         await document.exitFullscreen();
+      } else if (typeof doc.webkitExitFullscreen === 'function') {
+        await doc.webkitExitFullscreen();
       }
     } catch {
-      // Ignore fullscreen denial
+      if (video && typeof video.webkitEnterFullscreen === 'function') {
+        try {
+          video.webkitEnterFullscreen();
+        } catch {
+          // Ignore fullscreen denial
+        }
+      }
     }
   }, []);
 
@@ -580,7 +613,7 @@ export function VideoPlayer({
     setShowSettingsMenu(false);
   };
 
-  // Keyboard shortcuts when video is active and focus isn't inside an input
+  // Keyboard & LG webOS Smart TV Remote shortcuts
   useEffect(() => {
     if (!channel) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -591,24 +624,79 @@ export function VideoPlayer({
       ) {
         return;
       }
-      if (e.code === 'Space') {
+
+      const code = e.keyCode;
+      // LG webOS Media keys: Play (415), Pause (19), Stop (413), PlayPause (179), Rewind (412), FF (417)
+      // LG webOS Channel Up/Down: 427 / 428
+      if (e.code === 'Space' || code === 415 || code === 19 || code === 179 || e.key === 'MediaPlayPause') {
+        if (e.code === 'Space' && target?.tagName === 'BUTTON' && !isFullscreen) {
+          return;
+        }
         e.preventDefault();
         togglePlay();
+        revealControls();
+      } else if (code === 413 || e.key === 'MediaStop') {
+        e.preventDefault();
+        if (videoRef.current && !videoRef.current.paused) {
+          videoRef.current.pause();
+        }
+        revealControls();
+      } else if (code === 412 || e.key === 'MediaRewind') {
+        e.preventDefault();
+        seekBy(-10);
+        revealControls();
+      } else if (code === 417 || e.key === 'MediaFastForward') {
+        e.preventDefault();
+        seekBy(10);
+        revealControls();
+      } else if (code === 427 || e.key === 'ChannelUp' || e.key === 'PageUp') {
+        if (hasNext) {
+          e.preventDefault();
+          onNextChannel();
+        }
+      } else if (code === 428 || e.key === 'ChannelDown' || e.key === 'PageDown') {
+        if (hasPrev) {
+          e.preventDefault();
+          onPrevChannel();
+        }
       } else if (e.key === 'f' || e.key === 'F') {
         e.preventDefault();
-        toggleFullscreen();
+        void toggleFullscreen();
       } else if (e.key === 'm' || e.key === 'M') {
         e.preventDefault();
         toggleMute();
-      } else if (e.key === 'ArrowLeft') {
+      } else if (isFullscreen && e.key === 'ArrowLeft') {
+        e.preventDefault();
         seekBy(-10);
-      } else if (e.key === 'ArrowRight') {
+        revealControls();
+      } else if (isFullscreen && e.key === 'ArrowRight') {
+        e.preventDefault();
+        seekBy(10);
+        revealControls();
+      } else if (isFullscreen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        revealControls();
+      } else if (!tvMode && e.key === 'ArrowLeft') {
+        seekBy(-10);
+      } else if (!tvMode && e.key === 'ArrowRight') {
         seekBy(10);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [channel, togglePlay, toggleFullscreen, toggleMute, seekBy]);
+  }, [
+    channel,
+    isFullscreen,
+    tvMode,
+    hasNext,
+    hasPrev,
+    onNextChannel,
+    onPrevChannel,
+    togglePlay,
+    toggleFullscreen,
+    toggleMute,
+    seekBy,
+    revealControls,
+  ]);
 
   if (!channel) {
     return null;
@@ -1000,7 +1088,15 @@ export function VideoPlayer({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={toggleFullscreen}
+            className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-blue-600 px-3 text-xs font-medium text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
+          >
+            {isFullscreen ? <Minimize size={14} /> : <Maximize size={14} />}
+            <span>{isFullscreen ? 'Küçült' : 'Tam Ekran'}</span>
+          </button>
           <button
             type="button"
             onClick={onPrevChannel}

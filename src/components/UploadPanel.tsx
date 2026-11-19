@@ -46,15 +46,19 @@ function normalizeUrlInput(raw: string): string {
   return `http://${trimmed}`;
 }
 
-function extractXtreamFromM3uLink(parsed: URL): XtreamCredentials | null {
+function extractXtreamFromM3uLink(
+  parsed: URL,
+): (XtreamCredentials & {preferredLiveExt?: 'ts' | 'm3u8'}) | null {
   const isGetPhp = /\/get\.php$/i.test(parsed.pathname);
   const username = parsed.searchParams.get('username')?.trim();
   const password = parsed.searchParams.get('password')?.trim();
   if (!isGetPhp || !username || !password) return null;
+  const outputParam = parsed.searchParams.get('output')?.trim().toLowerCase();
   return {
     serverUrl: `${parsed.protocol}//${parsed.host}`,
     username,
     password,
+    preferredLiveExt: outputParam === 'ts' || outputParam === 'mpegts' ? 'ts' : undefined,
   };
 }
 
@@ -141,7 +145,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
   };
 
   const loginWithXtreamCredentials = async (
-    creds: XtreamCredentials,
+    creds: XtreamCredentials & {preferredLiveExt?: 'ts' | 'm3u8'},
     defaultPlaylistName: string,
   ): Promise<boolean> => {
     setLoadingStatus('Sunucu hesabı doğrulanıyor...');
@@ -205,9 +209,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
 
     const origin = data.serverOrigin || creds.serverUrl;
     const streamOrigin = data.streamOrigin || origin;
-    const liveExt = data.liveExt || 'm3u8';
+    const liveExt = creds.preferredLiveExt || data.liveExt || 'm3u8';
     const normalizedCreds: XtreamCredentials = {
       serverUrl: origin,
+      streamOrigin,
       username: creds.username,
       password: creds.password,
     };

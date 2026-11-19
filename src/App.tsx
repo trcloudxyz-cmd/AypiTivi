@@ -1,6 +1,7 @@
-import {LayoutGrid, List, Menu, Search, Upload, X} from 'lucide-react';
+import {LayoutGrid, List, Menu, Search, Tv, Upload, X} from 'lucide-react';
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {ChannelBrowser} from './components/ChannelBrowser';
+import {LgTvGuideModal} from './components/LgTvGuideModal';
 import {Sidebar, type GroupCount} from './components/Sidebar';
 import {UploadPanel} from './components/UploadPanel';
 import {VideoPlayer} from './components/VideoPlayer';
@@ -13,6 +14,7 @@ import {
   savePlaylist,
   savePreferences,
 } from './utils/storage';
+import {isSmartTvBrowser, moveSpatialFocus, type SpatialDirection} from './utils/tvNavigation';
 
 const QUICK_TABS: Array<{id: NavFilter; label: string}> = [
   {id: 'all', label: 'Tümü'},
@@ -47,8 +49,10 @@ export default function App() {
   const [playbackQueue, setPlaybackQueue] = useState<ChannelItem[] | null>(null);
 
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  const [isLgGuideOpen, setIsLgGuideOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isTheatreMode, setIsTheatreMode] = useState(false);
+  const [tvMode, setTvMode] = useState<boolean>(() => isSmartTvBrowser());
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const seriesEpisodesCacheRef = useRef<Map<string, ChannelItem[]>>(new Map());
@@ -73,12 +77,20 @@ export default function App() {
       }
       setFavorites(prefs.favorites);
       setRecentIds(prefs.recentIds);
+      if (typeof prefs.tvMode === 'boolean') {
+        setTvMode(prefs.tvMode);
+      }
       setIsHydrated(true);
     })();
     return () => {
       mounted = false;
     };
   }, []);
+
+  // Sync TV Mode class on root element
+  useEffect(() => {
+    document.documentElement.classList.toggle('tv-mode', tvMode);
+  }, [tvMode]);
 
   // Persist user preferences
   useEffect(() => {
@@ -87,30 +99,119 @@ export default function App() {
       activePlaylistId,
       favorites,
       recentIds,
+      tvMode,
     });
-  }, [isHydrated, activePlaylistId, favorites, recentIds]);
+  }, [isHydrated, activePlaylistId, favorites, recentIds, tvMode]);
 
-  // '/' shortcut focuses search bar
+  // '/' shortcut focuses search bar + LG TV Remote D-Pad & Back (461) navigation
   useEffect(() => {
+    const arrowDirMap: Record<string, SpatialDirection> = {
+      ArrowUp: 'up',
+      ArrowDown: 'down',
+      ArrowLeft: 'left',
+      ArrowRight: 'right',
+    };
+
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (
+      const isTextInput =
         target &&
-        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
-      ) {
-        if (e.key === 'Escape' && document.activeElement === searchInputRef.current) {
-          searchInputRef.current?.blur();
+        ((target.tagName === 'INPUT' &&
+          (target as HTMLInputElement).type !== 'range' &&
+          (target as HTMLInputElement).type !== 'checkbox') ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable);
+
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element | null;
+        webkitExitFullscreen?: () => Promise<void> | void;
+      };
+      const isFs = Boolean(document.fullscreenElement || doc.webkitFullscreenElement);
+
+      // LG webOS Back (461), Tizen Return (10009), Escape, or Backspace outside text input
+      const isBackKey =
+        e.keyCode === 461 ||
+        e.keyCode === 10009 ||
+        e.key === 'Escape' ||
+        e.key === 'XF86Back' ||
+        (e.key === 'Backspace' && !isTextInput);
+
+      if (isBackKey) {
+        if (isTextInput && e.key === 'Escape') {
+          target?.blur();
+          return;
+        }
+        if (isTextInput) return;
+
+        if (isFs) {
+          e.preventDefault();
+          if (typeof document.exitFullscreen === 'function') {
+            void document.exitFullscreen().catch(() => {});
+          } else if (typeof doc.webkitExitFullscreen === 'function') {
+            void doc.webkitExitFullscreen();
+          }
+          return;
+        }
+        if (isLgGuideOpen) {
+          e.preventDefault();
+          setIsLgGuideOpen(false);
+          return;
+        }
+        if (isUploadModalOpen) {
+          e.preventDefault();
+          setIsUploadModalOpen(false);
+          return;
+        }
+        if (isMobileMenuOpen) {
+          e.preventDefault();
+          setIsMobileMenuOpen(false);
+          return;
+        }
+        if (activeChannelId) {
+          e.preventDefault();
+          setActiveChannelId(null);
+          setOnDemandActiveChannel(null);
+          setPlaybackQueue(null);
+          setIsTheatreMode(false);
+          return;
         }
         return;
       }
+
+      if (isTextInput) {
+        if (tvMode && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+          const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+          const dir = arrowDirMap[e.key];
+          if (dir && moveSpatialFocus(dir, dialog ?? document.body)) {
+            e.preventDefault();
+          }
+        }
+        return;
+      }
+
       if (e.key === '/') {
         e.preventDefault();
         searchInputRef.current?.focus();
+        return;
+      }
+
+      // TV Mode spatial D-pad navigation when not inside fullscreen video
+      if (tvMode && !isFs && e.key in arrowDirMap) {
+        const isRange =
+          target?.tagName === 'INPUT' && (target as HTMLInputElement).type === 'range';
+        if (isRange && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+          return;
+        }
+        const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+        const dir = arrowDirMap[e.key];
+        if (dir && moveSpatialFocus(dir, dialog ?? document.body)) {
+          e.preventDefault();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [tvMode, isLgGuideOpen, isUploadModalOpen, isMobileMenuOpen, activeChannelId]);
 
   const activePlaylist = useMemo(
     () => playlists.find((p) => p.id === activePlaylistId) ?? null,
@@ -244,6 +345,7 @@ export default function App() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           serverUrl: creds.serverUrl,
+          streamOrigin: creds.streamOrigin,
           username: creds.username,
           password: creds.password,
           action: 'series_info',
@@ -424,6 +526,29 @@ export default function App() {
 
             {/* Right Controls */}
             <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setTvMode((prev) => !prev)}
+                aria-pressed={tvMode}
+                title="TV kumanda ve büyük ekran modu"
+                className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  tvMode
+                    ? 'border-blue-500/60 bg-blue-600/20 text-blue-300'
+                    : 'border-white/[0.08] bg-[#10131A] text-slate-300 hover:bg-white/[0.06] hover:text-white'
+                }`}
+              >
+                <Tv size={14} />
+                <span className="hidden sm:inline">TV Modu</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsLgGuideOpen(true)}
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#10131A] px-2.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/[0.06] hover:text-white whitespace-nowrap shrink-0"
+              >
+                <span>LG TV</span>
+              </button>
+
               <div className="hidden items-center rounded-lg border border-white/[0.08] bg-[#10131A] p-0.5 sm:flex">
                 <button
                   type="button"
@@ -507,6 +632,7 @@ export default function App() {
                     hasNext={activeChannelPos >= 0 && activeChannelPos < activeQueue.length - 1}
                     isTheatreMode={isTheatreMode}
                     onToggleTheatreMode={() => setIsTheatreMode((prev) => !prev)}
+                    tvMode={tvMode}
                   />
                 </div>
               )}
@@ -577,6 +703,15 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* LG TV Guide Modal */}
+      {isLgGuideOpen && (
+        <LgTvGuideModal
+          tvMode={tvMode}
+          onToggleTvMode={() => setTvMode((prev) => !prev)}
+          onClose={() => setIsLgGuideOpen(false)}
+        />
+      )}
 
       {/* Upload Modal */}
       {isUploadModalOpen && (

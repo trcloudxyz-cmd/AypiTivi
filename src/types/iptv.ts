@@ -4,6 +4,7 @@ export type NavFilter = 'all' | MediaCategory | 'favorites' | 'recent';
 
 export interface XtreamCredentials {
   serverUrl: string;
+  streamOrigin?: string;
   username: string;
   password: string;
 }
