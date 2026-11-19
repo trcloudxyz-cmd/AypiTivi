@@ -57,6 +57,95 @@ function formatTime(seconds: number): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+interface StreamCandidate {
+  url: string;
+  mode: 'hls' | 'mpegts' | 'flv' | 'native';
+}
+
+function buildStreamCandidates(channel: ChannelItem): StreamCandidate[] {
+  const rawUrl = channel.url.trim();
+  const [pathOnly] = rawUrl.split('?');
+  const lowerPath = pathOnly.toLowerCase();
+
+  if (
+    channel.streamFormat === 'native' ||
+    lowerPath.endsWith('.mp4') ||
+    lowerPath.endsWith('.webm') ||
+    lowerPath.endsWith('.m4v') ||
+    lowerPath.endsWith('.mov') ||
+    lowerPath.endsWith('.ogg') ||
+    lowerPath.endsWith('.mkv')
+  ) {
+    return [{url: rawUrl, mode: 'native'}];
+  }
+
+  if (channel.streamFormat === 'mpegts' || lowerPath.endsWith('.ts')) {
+    const candidates: StreamCandidate[] = [{url: rawUrl, mode: 'mpegts'}];
+    if (lowerPath.endsWith('.ts')) {
+      candidates.push({
+        url: rawUrl.replace(/\.ts(\?.*)?$/i, '.m3u8$1'),
+        mode: 'hls',
+      });
+    }
+    return candidates;
+  }
+
+  if (lowerPath.endsWith('.flv')) {
+    return [
+      {url: rawUrl, mode: 'flv'},
+      {url: rawUrl.replace(/\.flv(\?.*)?$/i, '.m3u8$1'), mode: 'hls'},
+    ];
+  }
+
+  if (lowerPath.endsWith('.m3u8') || lowerPath.endsWith('.m3u') || channel.streamFormat === 'hls') {
+    const candidates: StreamCandidate[] = [{url: rawUrl, mode: 'hls'}];
+    if (lowerPath.endsWith('.m3u8') && channel.mediaType === 'live') {
+      candidates.push({
+        url: rawUrl.replace(/\.m3u8(\?.*)?$/i, '.ts$1'),
+        mode: 'mpegts',
+      });
+    }
+    return candidates;
+  }
+
+  // Extensionless IPTV stream URL (common with output=ts panels like /user/pass/12345)
+  if (channel.mediaType === 'live') {
+    return [
+      {url: rawUrl, mode: 'mpegts'},
+      {url: rawUrl, mode: 'hls'},
+      {url: `${rawUrl}.m3u8`, mode: 'hls'},
+    ];
+  }
+
+  return [
+    {url: rawUrl, mode: 'hls'},
+    {url: rawUrl, mode: 'native'},
+  ];
+}
+
+function describeUpstreamStatus(status: number | null, usingProxy: boolean): string {
+  if (status === 401) {
+    return 'IPTV sunucusu hesap bilgilerini reddetti (HTTP 401). Kullanıcı adı veya şifre süresi dolmuş olabilir.';
+  }
+  if (status === 403) {
+    return usingProxy
+      ? 'Sunucu erişimi engelledi (HTTP 403). IPTV sağlayıcısı bulut/proxy IP adreslerini veya eşzamanlı bağlantıyı kısıtlıyor olabilir.'
+      : 'Yayın erişimi reddedildi (HTTP 403). Proxy ile oynatmayı deneyebilirsiniz.';
+  }
+  if (status === 404) {
+    return 'Yayın kanalı sunucuda bulunamadı (HTTP 404). Kanal çevrimdışı veya bağlantısı değişmiş olabilir.';
+  }
+  if (status === 429 || status === 503) {
+    return `IPTV sunucusu şu anda yoğun veya bağlantı limitine ulaşıldı (HTTP ${status}).`;
+  }
+  if (status && status >= 500) {
+    return `Yayın kaynağı yanıt vermiyor (HTTP ${status}). Sunucu geçici olarak çevrimdışı olabilir.`;
+  }
+  return usingProxy
+    ? 'Yayın kaynağına proxy üzerinden de ulaşılamadı. Bağlantı çevrimdışı veya sunucu proxy IP adresini engelliyor olabilir.'
+    : 'Yayın yüklenemedi (CORS veya ağ hatası). Proxy ile oynatmayı deneyebilirsiniz.';
+}
+
 export function VideoPlayer({
   channel,
   isFavorite,
@@ -78,6 +167,7 @@ export function VideoPlayer({
   const [isBuffering, setIsBuffering] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [useProxy, setUseProxy] = useState(false);
+  const [attemptIndex, setAttemptIndex] = useState(0);
   const [reloadNonce, setReloadNonce] = useState(0);
 
   const [volume, setVolume] = useState(0.85);
@@ -93,13 +183,14 @@ export function VideoPlayer({
   const [selectedAudio, setSelectedAudio] = useState<number>(0);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
 
-  // Reset proxy mode when switching channels (auto-proxy http:// streams on https:// pages)
+  // Reset proxy mode & attempt queue when switching channels
   useEffect(() => {
     const needsMixedContentProxy =
       typeof window !== 'undefined' &&
       window.location.protocol === 'https:' &&
       Boolean(channel?.url?.toLowerCase().startsWith('http://'));
     setUseProxy(needsMixedContentProxy);
+    setAttemptIndex(0);
     setErrorMessage(null);
     setQualities([]);
     setSelectedQuality(-1);
@@ -109,12 +200,17 @@ export function VideoPlayer({
     setDuration(0);
   }, [channel?.id, channel?.url]);
 
-  // Attach HLS / MPEG-TS / Native stream
+  // Attach HLS / MPEG-TS / Native stream with automatic format fallback
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !channel) return;
 
+    const candidates = buildStreamCandidates(channel);
+    const activeCandidate = candidates[Math.min(attemptIndex, candidates.length - 1)];
+    if (!activeCandidate) return;
+
     let cancelled = false;
+    let handledFailure = false;
     setIsBuffering(true);
     setErrorMessage(null);
 
@@ -128,22 +224,60 @@ export function VideoPlayer({
     }
 
     const effectiveUrl = useProxy
-      ? `/api/proxy-stream?url=${encodeURIComponent(channel.url)}`
-      : channel.url;
+      ? `/api/proxy-stream?url=${encodeURIComponent(activeCandidate.url)}`
+      : activeCandidate.url;
 
-    const lowerPath = channel.url.split('?')[0].toLowerCase();
-    const isDirectVideoFile =
-      channel.streamFormat === 'native' ||
-      lowerPath.endsWith('.mp4') ||
-      lowerPath.endsWith('.webm') ||
-      lowerPath.endsWith('.m4v') ||
-      lowerPath.endsWith('.mov') ||
-      lowerPath.endsWith('.ogg') ||
-      lowerPath.endsWith('.mkv');
-    const isMpegTs =
-      channel.streamFormat === 'mpegts' ||
-      lowerPath.endsWith('.ts') ||
-      lowerPath.endsWith('.flv');
+    const handleAttemptFailure = async () => {
+      if (cancelled || handledFailure) return;
+      handledFailure = true;
+
+      // Clean up current player instances immediately
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      if (mpegtsRef.current) {
+        mpegtsRef.current.destroy();
+        mpegtsRef.current = null;
+      }
+
+      // 1. Try next stream candidate format (.m3u8 <-> .ts)
+      if (attemptIndex + 1 < candidates.length) {
+        setAttemptIndex((idx) => idx + 1);
+        return;
+      }
+
+      // 2. If direct HTTPS stream failed (likely CORS), auto-switch to proxy
+      if (!useProxy) {
+        setAttemptIndex(0);
+        setUseProxy(true);
+        return;
+      }
+
+      // 3. All candidates exhausted — diagnose upstream HTTP status
+      let upstreamStatus: number | null = null;
+      const probeController = new AbortController();
+      const probeTimer = window.setTimeout(() => probeController.abort(), 5000);
+      try {
+        const probeRes = await fetch(effectiveUrl, {
+          method: 'GET',
+          credentials: 'include',
+          signal: probeController.signal,
+        });
+        const hdrStatus = probeRes.headers.get('X-Proxy-Upstream-Status');
+        upstreamStatus = hdrStatus ? Number(hdrStatus) : probeRes.status;
+        probeController.abort();
+      } catch {
+        // Ignore probe errors
+      } finally {
+        window.clearTimeout(probeTimer);
+      }
+
+      if (!cancelled) {
+        setIsBuffering(false);
+        setErrorMessage(describeUpstreamStatus(upstreamStatus, useProxy));
+      }
+    };
 
     const tryNativePlayback = () => {
       video.src = effectiveUrl;
@@ -154,16 +288,27 @@ export function VideoPlayer({
           if (!cancelled) setIsBuffering(false);
         })
         .catch(() => {
-          if (!cancelled) setIsBuffering(false);
+          // Wait for media events or onError
         });
     };
 
-    if (isMpegTs && mpegts.isSupported()) {
-      const player = mpegts.createPlayer({
-        type: lowerPath.endsWith('.flv') ? 'flv' : 'mpegts',
-        isLive: channel.mediaType === 'live',
-        url: effectiveUrl,
-      });
+    if (
+      (activeCandidate.mode === 'mpegts' || activeCandidate.mode === 'flv') &&
+      mpegts.isSupported()
+    ) {
+      const player = mpegts.createPlayer(
+        {
+          type: activeCandidate.mode === 'flv' ? 'flv' : 'mpegts',
+          isLive: channel.mediaType === 'live',
+          url: effectiveUrl,
+          withCredentials: useProxy,
+        },
+        {
+          enableStashBuffer: true,
+          autoCleanupSourceBuffer: true,
+          liveBufferLatencyChasing: channel.mediaType === 'live',
+        },
+      );
       mpegtsRef.current = player;
       player.attachMediaElement(video);
       player.load();
@@ -172,23 +317,22 @@ export function VideoPlayer({
           if (!cancelled) setIsBuffering(false);
         })
         .catch(() => {
-          if (!cancelled) setIsBuffering(false);
+          // Wait for playing or error event
         });
 
       player.on(mpegts.Events.ERROR, () => {
-        if (cancelled) return;
-        setIsBuffering(false);
-        setErrorMessage(
-          useProxy
-            ? 'TS yayın akışı proxy üzerinden de açılamadı. Akış çevrimdışı olabilir.'
-            : 'TS yayını açılamadı (CORS veya ağ hatası). Proxy ile oynatmayı deneyebilirsiniz.',
-        );
+        void handleAttemptFailure();
       });
-    } else if (!isDirectVideoFile && Hls.isSupported()) {
+    } else if (activeCandidate.mode === 'hls' && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: channel.mediaType === 'live',
         backBufferLength: 60,
+        xhrSetup: useProxy
+          ? (xhr) => {
+              xhr.withCredentials = true;
+            }
+          : undefined,
       });
       hlsRef.current = hls;
 
@@ -225,25 +369,10 @@ export function VideoPlayer({
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (cancelled) return;
         if (data.fatal) {
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            if (isDirectVideoFile) {
-              hls.destroy();
-              hlsRef.current = null;
-              tryNativePlayback();
-              return;
-            }
-            setIsBuffering(false);
-            setErrorMessage(
-              useProxy
-                ? 'Yayın kaynağına proxy üzerinden de ulaşılamadı. Bağlantı çevrimdışı olabilir.'
-                : 'Yayın yüklenemedi (CORS veya ağ hatası). Proxy ile oynatmayı deneyebilirsiniz.',
-            );
-          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             hls.recoverMediaError();
           } else {
-            hls.destroy();
-            hlsRef.current = null;
-            tryNativePlayback();
+            void handleAttemptFailure();
           }
         }
       });
@@ -264,7 +393,7 @@ export function VideoPlayer({
       video.removeAttribute('src');
       video.load();
     };
-  }, [channel, useProxy, reloadNonce]);
+  }, [channel, useProxy, attemptIndex, reloadNonce]);
 
   // Keep volume synced
   useEffect(() => {
@@ -426,13 +555,15 @@ export function VideoPlayer({
           }}
           onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
           onDurationChange={(e) => setDuration(e.currentTarget.duration)}
-          onError={() => {
-            setIsBuffering(false);
-            setErrorMessage(
-              useProxy
-                ? 'Yayın formatı tarayıcı tarafından desteklenmiyor veya kaynak yanıt vermiyor.'
-                : 'Video akışı oynatılamadı. CORS engeli varsa proxy ile deneyebilirsiniz.',
-            );
+          onError={(e) => {
+            if (!hlsRef.current && !mpegtsRef.current && e.currentTarget.getAttribute('src')) {
+              setIsBuffering(false);
+              setErrorMessage(
+                useProxy
+                  ? 'Yayın formatı tarayıcı tarafından desteklenmiyor veya kaynak yanıt vermiyor.'
+                  : 'Video akışı oynatılamadı. CORS engeli varsa proxy ile deneyebilirsiniz.',
+              );
+            }
           }}
           className="h-full w-full cursor-pointer object-contain"
         />
@@ -449,7 +580,7 @@ export function VideoPlayer({
 
         {/* Error Overlay */}
         {errorMessage && (
-          <div className="absolute inset-0 flex items-center justify-center bg-[#090B0F]/92 p-6">
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-[#090B0F]/92 p-6">
             <div className="max-w-md text-center">
               <AlertTriangle className="mx-auto mb-3 h-9 w-9 text-amber-400" />
               <h3 className="font-display text-base font-semibold text-white">
@@ -459,22 +590,39 @@ export function VideoPlayer({
               <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
                 <button
                   type="button"
-                  onClick={() => setReloadNonce((n) => n + 1)}
+                  onClick={() => {
+                    setAttemptIndex(0);
+                    setReloadNonce((n) => n + 1);
+                  }}
                   className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-white/10 whitespace-nowrap shrink-0"
                 >
                   <RefreshCw size={14} />
                   <span>Tekrar Dene</span>
                 </button>
-                {!useProxy && (
+                {!useProxy ? (
                   <button
                     type="button"
-                    onClick={() => setUseProxy(true)}
+                    onClick={() => {
+                      setAttemptIndex(0);
+                      setUseProxy(true);
+                    }}
                     className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
                   >
                     <ShieldCheck size={14} />
                     <span>Proxy ile Oynat</span>
                   </button>
-                )}
+                ) : channel.url.toLowerCase().startsWith('https://') ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAttemptIndex(0);
+                      setUseProxy(false);
+                    }}
+                    className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-white/10 whitespace-nowrap shrink-0"
+                  >
+                    <span>Proxysiz Dene</span>
+                  </button>
+                ) : null}
               </div>
             </div>
           </div>
