@@ -272,7 +272,7 @@ const DIRECT_STREAM_EXTENSIONS = ['.ts', '.mp4', '.mkv', '.webm', '.avi', '.mov'
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Akis IPTV server running on http://0.0.0.0:${PORT}`);
+    console.log(`AyPi Tivi server running on http://0.0.0.0:${PORT}`);
   });
 }
 

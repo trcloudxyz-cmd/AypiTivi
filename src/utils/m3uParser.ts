@@ -352,7 +352,7 @@ export function createSamplePlaylist(): Playlist {
     {
       id: 'sample_live_1',
       index: 1,
-      name: 'Akış Haber HD (Canlı Test Yayını)',
+      name: 'AyPi Tivi Haber HD (Canlı Test Yayını)',
       url: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
       logo: liveBroadcastImg,
       group: 'Haber & Yayın',

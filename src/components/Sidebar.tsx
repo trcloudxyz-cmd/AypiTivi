@@ -72,7 +72,7 @@ export function Sidebar({
       {/* Brand Header */}
       <div className="flex h-16 items-center justify-between border-b border-white/[0.07] px-5 shrink-0">
         <span className="font-display text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0">
-          AyPi TiVi
+          AyPi Tivi
         </span>
         <button
           type="button"
