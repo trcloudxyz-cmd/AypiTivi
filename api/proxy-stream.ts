@@ -2,8 +2,9 @@ import type {IncomingMessage, ServerResponse} from 'node:http';
 
 const IPTV_USER_AGENTS = [
   'VLC/3.0.20 LibVLC/3.0.20',
-  'Lavf/58.76.100',
   'IPTVSmartersPro/1.0',
+  'Dalvik/2.1.0 (Linux; U; Android 13; SM-S918B Build/TP1A.220624.014)',
+  'Lavf/58.76.100',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
 ];
 
@@ -187,7 +188,10 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       if (
         upstream.ok ||
         upstream.status === 206 ||
-        (upstream.status !== 403 && upstream.status !== 406 && upstream.status !== 503)
+        (upstream.status !== 401 &&
+          upstream.status !== 403 &&
+          upstream.status !== 406 &&
+          upstream.status !== 503)
       ) {
         break;
       }

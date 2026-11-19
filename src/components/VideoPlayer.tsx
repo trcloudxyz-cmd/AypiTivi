@@ -134,7 +134,9 @@ function buildStreamCandidates(channel: ChannelItem): StreamCandidate[] {
 
 function describeUpstreamStatus(status: number | null, usingProxy: boolean): string {
   if (status === 401) {
-    return 'IPTV sunucusu hesap bilgilerini reddetti (HTTP 401). Kullanıcı adı veya şifre süresi dolmuş olabilir.';
+    return usingProxy
+      ? 'IPTV sunucusu yayın akışını reddetti (HTTP 401). Hesap/bağlantı limiti dolmuş olabilir veya IPTV sağlayıcınız Ülke (TR) / ISP / Proxy IP kilidi uyguluyor olabilir.'
+      : 'IPTV sunucusu hesap bilgilerini reddetti (HTTP 401). Kullanıcı adı veya şifre süresi dolmuş olabilir.';
   }
   if (status === 403) {
     return usingProxy

@@ -161,6 +161,8 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       mode?: 'xtream' | 'm3u';
       content?: string;
       serverOrigin?: string;
+      streamOrigin?: string;
+      liveExt?: 'm3u8' | 'ts';
       error?: string;
       accountInfo?: {
         status?: string;
@@ -202,6 +204,8 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     }
 
     const origin = data.serverOrigin || creds.serverUrl;
+    const streamOrigin = data.streamOrigin || origin;
+    const liveExt = data.liveExt || 'm3u8';
     const normalizedCreds: XtreamCredentials = {
       serverUrl: origin,
       username: creds.username,
@@ -216,6 +220,8 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           serverUrl: origin,
+          streamOrigin,
+          liveExt,
           username: creds.username,
           password: creds.password,
           action,

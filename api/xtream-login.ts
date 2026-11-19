@@ -166,6 +166,10 @@ export default async function handler(
   }
 
   const baseOrigin = baseUrl.toString().replace(/\/+$/, '');
+  const rawStreamOrigin = typeof body.streamOrigin === 'string' ? body.streamOrigin.trim() : '';
+  const streamOriginUrl = rawStreamOrigin ? extractXtreamBaseUrl(rawStreamOrigin) : null;
+  const streamOrigin = streamOriginUrl ? streamOriginUrl.toString().replace(/\/+$/, '') : baseOrigin;
+  const liveExt = body.liveExt === 'ts' ? 'ts' : 'm3u8';
   const encodedUser = encodeURIComponent(username);
   const encodedPass = encodeURIComponent(password);
   const apiBase = `${baseOrigin}/player_api.php?username=${encodedUser}&password=${encodedPass}`;
@@ -213,7 +217,7 @@ export default async function handler(
             id: `xt_ep_${ep.id}`,
             index: idx++,
             name: epName,
-            url: `${baseOrigin}/series/${encodedUser}/${encodedPass}/${ep.id}.${ext}`,
+            url: `${streamOrigin}/series/${encodedUser}/${encodedPass}/${ep.id}.${ext}`,
             logo: ep.info?.movie_image || seriesLogo || info.info?.cover || undefined,
             group: seriesGroup,
             mediaType: 'series',
@@ -264,7 +268,7 @@ export default async function handler(
               id: `xt_live_${s.stream_id}`,
               index: idx + 1,
               name,
-              url: `${baseOrigin}/live/${encodedUser}/${encodedPass}/${s.stream_id}.m3u8`,
+              url: `${streamOrigin}/live/${encodedUser}/${encodedPass}/${s.stream_id}.${liveExt}`,
               logo: s.stream_icon || undefined,
               group: catMap.get(String(s.category_id || '')) || 'Canlı TV',
               mediaType: 'live',
@@ -306,7 +310,7 @@ export default async function handler(
               id: `xt_vod_${s.stream_id}`,
               index: idx + 1,
               name,
-              url: `${baseOrigin}/movie/${encodedUser}/${encodedPass}/${s.stream_id}.${ext}`,
+              url: `${streamOrigin}/movie/${encodedUser}/${encodedPass}/${s.stream_id}.${ext}`,
               logo: s.stream_icon || undefined,
               group: catMap.get(String(s.category_id || '')) || 'Filmler',
               mediaType: 'movie',
@@ -365,6 +369,7 @@ export default async function handler(
   let accountInfo: {status?: string; expDate?: string; maxConnections?: string} | undefined;
   let playerApiSupported = false;
   let resolvedServerOrigin = baseOrigin;
+  let resolvedLiveExt: 'm3u8' | 'ts' = 'm3u8';
 
   try {
     const authController = new AbortController();
@@ -376,6 +381,7 @@ export default async function handler(
           status?: string;
           exp_date?: string | null;
           max_connections?: string;
+          allowed_output_formats?: string[];
         };
         server_info?: {
           url?: string;
@@ -404,17 +410,29 @@ export default async function handler(
           maxConnections: authJson.user_info.max_connections,
         };
 
+        const formats = Array.isArray(authJson.user_info.allowed_output_formats)
+          ? authJson.user_info.allowed_output_formats.map((f) => String(f).toLowerCase())
+          : [];
+        if (formats.length > 0 && !formats.includes('m3u8') && formats.includes('ts')) {
+          resolvedLiveExt = 'ts';
+        }
+
         const si = authJson.server_info;
-        if (
-          si?.server_protocol?.toLowerCase() === 'https' &&
-          si.url &&
-          !isBlockedHostname(si.url)
-        ) {
-          const httpsPort = si.https_port ? String(si.https_port).trim() : '443';
-          const portSuffix = httpsPort && httpsPort !== '443' ? `:${httpsPort}` : '';
-          const candidate = extractXtreamBaseUrl(`https://${si.url}${portSuffix}`);
-          if (candidate) {
-            resolvedServerOrigin = candidate.toString().replace(/\/+$/, '');
+        if (si?.url && !isBlockedHostname(si.url)) {
+          if (si.server_protocol?.toLowerCase() === 'https') {
+            const httpsPort = si.https_port ? String(si.https_port).trim() : '443';
+            const portSuffix = httpsPort && httpsPort !== '443' ? `:${httpsPort}` : '';
+            const candidate = extractXtreamBaseUrl(`https://${si.url}${portSuffix}`);
+            if (candidate) {
+              resolvedServerOrigin = candidate.toString().replace(/\/+$/, '');
+            }
+          } else {
+            const httpPort = si.port ? String(si.port).trim() : '80';
+            const portSuffix = httpPort && httpPort !== '80' ? `:${httpPort}` : '';
+            const candidate = extractXtreamBaseUrl(`http://${si.url}${portSuffix}`);
+            if (candidate) {
+              resolvedServerOrigin = candidate.toString().replace(/\/+$/, '');
+            }
           }
         }
       }
@@ -428,7 +446,9 @@ export default async function handler(
   if (playerApiSupported) {
     sendJson(res, 200, {
       mode: 'xtream',
-      serverOrigin: resolvedServerOrigin,
+      serverOrigin: baseOrigin,
+      streamOrigin: resolvedServerOrigin,
+      liveExt: resolvedLiveExt,
       accountInfo,
     });
     return;
