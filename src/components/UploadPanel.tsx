@@ -10,7 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import {useRef, useState} from 'react';
-import type {Playlist} from '../types/iptv';
+import type {ChannelItem, Playlist, XtreamCredentials} from '../types/iptv';
 import {
   computePlaylistStats,
   createDirectStreamItem,
@@ -46,6 +46,18 @@ function normalizeUrlInput(raw: string): string {
   return `http://${trimmed}`;
 }
 
+function extractXtreamFromM3uLink(parsed: URL): XtreamCredentials | null {
+  const isGetPhp = /\/get\.php$/i.test(parsed.pathname);
+  const username = parsed.searchParams.get('username')?.trim();
+  const password = parsed.searchParams.get('password')?.trim();
+  if (!isGetPhp || !username || !password) return null;
+  return {
+    serverUrl: `${parsed.protocol}//${parsed.host}`,
+    username,
+    password,
+  };
+}
+
 async function ensureIframeStorageAccess() {
   try {
     if (
@@ -56,7 +68,7 @@ async function ensureIframeStorageAccess() {
       await document.requestStorageAccess();
     }
   } catch {
-    // Ignore if browser blocks or doesn't require storage access
+    // Ignore
   }
 }
 
@@ -75,6 +87,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
   const [accountMeta, setAccountMeta] = useState<string | null>(null);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [pendingPlaylist, setPendingPlaylist] = useState<Playlist | null>(null);
 
@@ -84,6 +97,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     setError(null);
     setPendingPlaylist(null);
     setAccountMeta(null);
+    setLoadingStatus('');
   };
 
   const buildPendingPlaylist = (
@@ -91,6 +105,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     defaultName: string,
     sourceType: Playlist['sourceType'],
     sourceRef?: string,
+    xtreamCredentials?: XtreamCredentials,
   ) => {
     const finalName = playlistName.trim() || defaultName;
     const playlist: Playlist = {
@@ -98,6 +113,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       name: finalName,
       sourceType,
       sourceRef,
+      xtreamCredentials,
       createdAt: Date.now(),
       items,
     };
@@ -122,6 +138,110 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       return;
     }
     buildPendingPlaylist(items, defaultName, sourceType, sourceRef);
+  };
+
+  const loginWithXtreamCredentials = async (
+    creds: XtreamCredentials,
+    defaultPlaylistName: string,
+  ): Promise<boolean> => {
+    setLoadingStatus('Sunucu hesabı doğrulanıyor...');
+    const response = await fetch('/api/xtream-login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        serverUrl: creds.serverUrl,
+        username: creds.username,
+        password: creds.password,
+        action: 'auth',
+      }),
+    });
+
+    const {data, rawText} = await parseJsonResponse<{
+      mode?: 'xtream' | 'm3u';
+      content?: string;
+      serverOrigin?: string;
+      error?: string;
+      accountInfo?: {
+        status?: string;
+        expDate?: string;
+      };
+    }>(response);
+
+    if (!data) {
+      const snippet = rawText.replace(/<[^>]+>/g, ' ').trim().slice(0, 80);
+      throw new Error(
+        `Sunucu giriş servisine ulaşılamadı (HTTP ${response.status}${
+          snippet ? ` — ${snippet}` : ''
+        }).`,
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(data.error || 'Sunucuya giriş yapılamadı.');
+    }
+
+    if (data.accountInfo?.expDate) {
+      const expTimestamp = Number(data.accountInfo.expDate);
+      if (Number.isFinite(expTimestamp) && expTimestamp > 0) {
+        const formattedDate = new Date(expTimestamp * 1000).toLocaleDateString('tr-TR');
+        setAccountMeta(`Durum: Aktif · Bitiş: ${formattedDate}`);
+      } else {
+        setAccountMeta('Durum: Aktif');
+      }
+    }
+
+    if (data.mode === 'm3u' && data.content) {
+      processM3uContent(
+        data.content,
+        defaultPlaylistName,
+        'xtream',
+        data.serverOrigin || creds.serverUrl,
+      );
+      return true;
+    }
+
+    const origin = data.serverOrigin || creds.serverUrl;
+    const normalizedCreds: XtreamCredentials = {
+      serverUrl: origin,
+      username: creds.username,
+      password: creds.password,
+    };
+
+    setLoadingStatus('Canlı TV, Filmler ve Diziler yükleniyor...');
+    const fetchCategory = async (action: 'live' | 'movie' | 'series'): Promise<ChannelItem[]> => {
+      const res = await fetch('/api/xtream-login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          serverUrl: origin,
+          username: creds.username,
+          password: creds.password,
+          action,
+        }),
+      });
+      const parsed = await parseJsonResponse<{items?: ChannelItem[]}>(res);
+      return parsed.data?.items || [];
+    };
+
+    const [liveItems, movieItems, seriesItems] = await Promise.all([
+      fetchCategory('live'),
+      fetchCategory('movie'),
+      fetchCategory('series'),
+    ]);
+
+    const combined = [...liveItems, ...movieItems, ...seriesItems].map((item, idx) => ({
+      ...item,
+      index: idx + 1,
+    }));
+
+    if (combined.length === 0) {
+      return false;
+    }
+
+    buildPendingPlaylist(combined, defaultPlaylistName, 'xtream', origin, normalizedCreds);
+    return true;
   };
 
   const fetchOrAddUrl = async (rawUrl: string) => {
@@ -155,9 +275,25 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     }
 
     setError(null);
+    setAccountMeta(null);
     setIsLoading(true);
+    setLoadingStatus('Bağlantı kontrol ediliyor...');
+
     try {
       await ensureIframeStorageAccess();
+
+      // If user pasted an Xtream get.php?username=...&password=... link, use fast segmented Xtream loader first!
+      const xtreamCreds = extractXtreamFromM3uLink(parsedUrl);
+      if (xtreamCreds) {
+        try {
+          const ok = await loginWithXtreamCredentials(xtreamCreds, derivedName);
+          if (ok) return;
+        } catch {
+          // Fall back to standard /api/fetch-m3u if server doesn't expose player_api.php
+        }
+      }
+
+      setLoadingStatus('M3U listesi indiriliyor...');
       const response = await fetch('/api/fetch-m3u', {
         method: 'POST',
         credentials: 'include',
@@ -202,7 +338,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         return;
       }
 
-      // Fallback when backend API wasn't reachable (e.g. static preview or blocked iframe cookie)
+      // Direct browser fetch fallback for CORS-enabled HTTPS links
       try {
         const directRes = await fetch(normalized);
         if (!directRes.ok) {
@@ -217,18 +353,15 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         processM3uContent(directText, derivedName, 'url', normalized);
       } catch {
         const snippet = rawText.replace(/<[^>]+>/g, ' ').trim().slice(0, 80);
-        const hint =
-          window.location.protocol === 'https:' && normalized.startsWith('http://')
-            ? 'HTTP bağlantıları tarayıcıda güvenlik nedeniyle yalnızca sunucu vekili aktifken çekilebilir; alternatif olarak M3U dosyasını cihazınıza indirip "Dosya Yükle" sekmesinden ekleyebilirsiniz.'
-            : 'Bağlantıdan liste çekilemedi. M3U dosyasını indirip "Dosya Yükle" sekmesinden yükleyebilirsiniz.';
         throw new Error(
-          `${hint}${snippet ? ` (Servis yanıtı: HTTP ${response.status} — ${snippet})` : ''}`,
+          `Bağlantıdan liste çekilemedi${snippet ? ` (HTTP ${response.status})` : ''}. Sunucu adresini kontrol edin veya M3U dosyasını indirip "Dosya Yükle" sekmesinden yükleyin.`,
         );
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Bağlantıdan içerik yüklenemedi.');
     } finally {
       setIsLoading(false);
+      setLoadingStatus('');
     }
   };
 
@@ -257,85 +390,25 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
 
     try {
       await ensureIframeStorageAccess();
-      const response = await fetch('/api/xtream-login', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          serverUrl: cleanServer,
-          username: cleanUser,
-          password: cleanPass,
-        }),
-      });
-
-      const {data, rawText} = await parseJsonResponse<{
-        content?: string;
-        serverOrigin?: string;
-        error?: string;
-        accountInfo?: {
-          status?: string;
-          expDate?: string;
-          maxConnections?: string;
-        };
-      }>(response);
-
-      if (!data) {
-        // If serverUrl is HTTPS and CORS allows, try direct get.php fallback
-        if (cleanServer.startsWith('https://')) {
-          try {
-            const baseOrigin = cleanServer.replace(/\/+$/, '');
-            const directM3u = await fetch(
-              `${baseOrigin}/get.php?username=${encodeURIComponent(cleanUser)}&password=${encodeURIComponent(cleanPass)}&type=m3u_plus&output=m3u8`,
-            );
-            if (directM3u.ok) {
-              const text = await directM3u.text();
-              if (text.includes('#EXTINF') || text.includes('#EXTM3U')) {
-                processM3uContent(text, playlistName.trim() || parsedHost, 'url', baseOrigin);
-                return;
-              }
-            }
-          } catch {
-            // Fall through to diagnostic error
-          }
-        }
-        const snippet = rawText.replace(/<[^>]+>/g, ' ').trim().slice(0, 80);
-        throw new Error(
-          `Sunucu giriş servisine ulaşılamadı (HTTP ${response.status}${
-            snippet ? ` — ${snippet}` : ''
-          }). Uygulamayı geliştirme/önizleme penceresinde açtığınızdan veya M3U dosyasını "Dosya Yükle" ile eklediğinizden emin olun.`,
-        );
-      }
-
-      if (!response.ok || !data.content) {
-        throw new Error(data.error || 'Sunucuya giriş yapılamadı.');
-      }
-
-      if (data.accountInfo?.expDate) {
-        const expTimestamp = Number(data.accountInfo.expDate);
-        if (Number.isFinite(expTimestamp) && expTimestamp > 0) {
-          const formattedDate = new Date(expTimestamp * 1000).toLocaleDateString('tr-TR');
-          setAccountMeta(`Durum: Aktif · Bitiş: ${formattedDate}`);
-        } else {
-          setAccountMeta('Durum: Aktif');
-        }
-      }
-
-      processM3uContent(
-        data.content,
-        playlistName.trim() || parsedHost,
-        'url',
-        data.serverOrigin || cleanServer,
+      const ok = await loginWithXtreamCredentials(
+        {serverUrl: cleanServer, username: cleanUser, password: cleanPass},
+        parsedHost,
       );
+      if (!ok) {
+        setError('Sunucuda gösterilecek kanal, film veya dizi bulunamadı.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Sunucu girişi başarısız oldu.');
     } finally {
       setIsLoading(false);
+      setLoadingStatus('');
     }
   };
 
   const handleFile = async (file: File) => {
     setError(null);
     setIsLoading(true);
+    setLoadingStatus('Dosya ayrıştırılıyor...');
     try {
       const lowerName = file.name.toLowerCase();
       const baseName =
@@ -355,6 +428,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       setError('Dosya okunurken bir hata oluştu.');
     } finally {
       setIsLoading(false);
+      setLoadingStatus('');
     }
   };
 
@@ -488,10 +562,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         </button>
       </div>
 
-      {/* Playlist Name (shared across all tabs) */}
+      {/* Playlist Name */}
       <div className="mt-5">
         <label htmlFor="playlist-name-input" className="block text-xs font-medium text-slate-300">
-          Liste Adı {activeTab === 'server' ? '(İsteğe Bağlı)' : '(İsteğe Bağlı)'}
+          Liste Adı (İsteğe Bağlı)
         </label>
         <input
           id="playlist-name-input"
@@ -546,7 +620,9 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             <Upload size={22} />
           </div>
           <p className="mt-4 text-sm font-medium text-white">
-            {isLoading ? 'Dosya ayrıştırılıyor...' : 'M3U, M3U8 veya TS dosyasını buraya sürükleyin veya seçin'}
+            {isLoading
+              ? loadingStatus || 'Dosya ayrıştırılıyor...'
+              : 'M3U, M3U8 veya TS dosyasını buraya sürükleyin veya seçin'}
           </p>
           <p className="mt-1 text-xs text-slate-400">
             Desteklenen formatlar: .m3u, .m3u8, .ts, .mp4 (isteğe bağlı .txt)
@@ -567,12 +643,12 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
               inputMode="url"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="https://ornek.com/liste.m3u veya https://ornek.com/yayin.ts"
+              placeholder="http://sunucu.com:80/get.php?username=...&password=...&type=m3u_plus&output=ts"
               required
               className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 font-mono text-xs text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none sm:text-sm"
             />
             <p className="mt-1.5 text-xs text-slate-500">
-              Hem .m3u / .m3u8 liste linklerini hem de doğrudan .ts / .mp4 yayın bağlantılarını destekler.
+              Hem M3U / get.php liste linklerini hem de doğrudan .ts / .m3u8 / .mp4 yayın bağlantılarını destekler.
             </p>
           </div>
           <button
@@ -580,7 +656,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             disabled={isLoading}
             className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
           >
-            {isLoading ? 'Yükleniyor...' : 'Linkten Ekle'}
+            {isLoading ? loadingStatus || 'Yükleniyor...' : 'Linkten Ekle'}
           </button>
         </form>
       )}
@@ -648,12 +724,12 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
               inputMode="url"
               value={serverUrl}
               onChange={(e) => setServerUrl(e.target.value)}
-              placeholder="http://sunucu.ornek.com:8080"
+              placeholder="http://sunucu.ornek.com:80"
               required
               className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 font-mono text-xs text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none sm:text-sm"
             />
             <p className="mt-1.5 text-xs text-slate-500">
-              Xtream Codes API veya standart IPTV sunucu adresinizi port numarasıyla birlikte girin.
+              Canlı TV, Filmler ve Dizileri kendi kategorileriyle ayrı ayrı yükler.
             </p>
           </div>
 
@@ -662,7 +738,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             disabled={isLoading}
             className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
           >
-            {isLoading ? 'Sunucuya Bağlanılıyor...' : 'Sunucudan Giriş Yap'}
+            {isLoading ? loadingStatus || 'Sunucuya Bağlanılıyor...' : 'Sunucudan Giriş Yap'}
           </button>
         </form>
       )}
@@ -690,7 +766,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             disabled={isLoading}
             className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
           >
-            {isLoading ? 'İşleniyor...' : 'Listeye Ekle'}
+            {isLoading ? loadingStatus || 'İşleniyor...' : 'Listeye Ekle'}
           </button>
         </form>
       )}

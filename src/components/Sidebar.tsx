@@ -4,11 +4,13 @@ import {
   Film,
   Layers,
   Plus,
+  Search,
   Star,
   Trash2,
   Tv,
   X,
 } from 'lucide-react';
+import {useMemo, useState} from 'react';
 import type {NavFilter, Playlist, PlaylistStats} from '../types/iptv';
 
 export interface GroupCount {
@@ -51,6 +53,8 @@ export function Sidebar({
   mobileOpen,
   onCloseMobile,
 }: SidebarProps) {
+  const [categoryQuery, setCategoryQuery] = useState('');
+
   const navItems: Array<{
     id: NavFilter;
     label: string;
@@ -66,6 +70,12 @@ export function Sidebar({
   ];
 
   const totalInGroups = groups.reduce((acc, g) => acc + g.count, 0);
+
+  const visibleGroups = useMemo(() => {
+    const q = categoryQuery.trim().toLocaleLowerCase('tr-TR');
+    if (!q) return groups;
+    return groups.filter((g) => g.name.toLocaleLowerCase('tr-TR').includes(q));
+  }, [groups, categoryQuery]);
 
   const sidebarContent = (
     <div className="flex h-full flex-col bg-[#0D1016] text-slate-200">
@@ -95,7 +105,7 @@ export function Sidebar({
           className="flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-medium text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
         >
           <Plus size={16} />
-          <span>M3U Liste Yükle</span>
+          <span>M3U / Sunucu Ekle</span>
         </button>
       </div>
 
@@ -140,7 +150,7 @@ export function Sidebar({
 
         {/* Saved Playlists */}
         {playlists.length > 0 && (
-          <div className="mt-6 border-t border-white/[0.06] pt-5">
+          <div className="mt-5 border-t border-white/[0.06] pt-4">
             <p className="px-2.5 pb-1.5 text-xs font-medium text-slate-500">Kayıtlı Listeler</p>
             <div className="space-y-0.5">
               {playlists.map((pl) => {
@@ -184,28 +194,58 @@ export function Sidebar({
 
         {/* Group / Category Filter */}
         {groups.length > 0 && (
-          <div className="mt-6 border-t border-white/[0.06] pt-5">
-            <p className="px-2.5 pb-1.5 text-xs font-medium text-slate-500">Kategoriler</p>
-            <div className="space-y-0.5">
-              <button
-                type="button"
-                onClick={() => {
-                  onSelectGroup('__ALL__');
-                  onCloseMobile();
-                }}
-                className={`flex h-9 w-full items-center justify-between rounded-lg px-2.5 text-sm transition-colors ${
-                  selectedGroup === '__ALL__'
-                    ? 'bg-[#171D28] font-medium text-white'
-                    : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
-                }`}
-              >
-                <span className="truncate">Tüm Kategoriler</span>
-                <span className="ml-2 font-mono text-xs tabular-nums text-slate-500 shrink-0">
-                  {totalInGroups.toLocaleString('tr-TR')}
-                </span>
-              </button>
+          <div className="mt-5 border-t border-white/[0.06] pt-4">
+            <p className="px-2.5 pb-2 text-xs font-medium text-slate-500">Kategoriler</p>
 
-              {groups.map((grp) => {
+            {groups.length > 6 && (
+              <div className="relative mb-2 px-1">
+                <Search
+                  size={13}
+                  className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-slate-500"
+                />
+                <input
+                  type="search"
+                  value={categoryQuery}
+                  onChange={(e) => setCategoryQuery(e.target.value)}
+                  placeholder="Kategori ara..."
+                  aria-label="Kategori ara"
+                  className="h-8 w-full rounded-lg border border-white/[0.08] bg-[#090B0F] pr-7 pl-8 text-xs text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+                />
+                {categoryQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setCategoryQuery('')}
+                    aria-label="Kategori aramasını temizle"
+                    className="absolute top-1/2 right-2.5 -translate-y-1/2 text-slate-400 hover:text-white"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="space-y-0.5">
+              {!categoryQuery && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectGroup('__ALL__');
+                    onCloseMobile();
+                  }}
+                  className={`flex h-9 w-full items-center justify-between rounded-lg px-2.5 text-sm transition-colors ${
+                    selectedGroup === '__ALL__'
+                      ? 'bg-[#171D28] font-medium text-white'
+                      : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
+                  }`}
+                >
+                  <span className="truncate">Tüm Kategoriler</span>
+                  <span className="ml-2 font-mono text-xs tabular-nums text-slate-500 shrink-0">
+                    {totalInGroups.toLocaleString('tr-TR')}
+                  </span>
+                </button>
+              )}
+
+              {visibleGroups.map((grp) => {
                 const isSelected = selectedGroup === grp.name;
                 return (
                   <button
@@ -228,6 +268,10 @@ export function Sidebar({
                   </button>
                 );
               })}
+
+              {visibleGroups.length === 0 && (
+                <p className="px-2.5 py-2 text-xs text-slate-500">Kategori bulunamadı.</p>
+              )}
             </div>
           </div>
         )}
@@ -238,7 +282,7 @@ export function Sidebar({
   return (
     <>
       {/* Desktop Sidebar */}
-      <aside className="hidden w-[264px] shrink-0 border-r border-white/[0.07] lg:block">
+      <aside className="hidden w-[272px] shrink-0 border-r border-white/[0.07] lg:block">
         <div className="sticky top-0 h-screen">{sidebarContent}</div>
       </aside>
 

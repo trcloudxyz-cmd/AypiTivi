@@ -136,7 +136,7 @@ export default async function handler(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 22000);
+  const timeout = setTimeout(() => controller.abort(), 24000);
 
   try {
     const upstream = await fetchIptv(targetUrl.toString(), controller.signal);
@@ -148,11 +148,11 @@ export default async function handler(
       return;
     }
 
+    // Only treat explicit video/* or audio/* (excluding mpegurl) as direct stream;
+    // Many IPTV panels serve M3U playlists as application/octet-stream!
     const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
     const isMediaBinary =
-      (contentType.startsWith('video/') ||
-        contentType.startsWith('audio/') ||
-        contentType === 'application/octet-stream') &&
+      (contentType.startsWith('video/') || contentType.startsWith('audio/')) &&
       !contentType.includes('mpegurl');
 
     if (isMediaBinary) {
@@ -185,7 +185,7 @@ export default async function handler(
   } catch (err) {
     const message =
       err instanceof Error && err.name === 'AbortError'
-        ? 'Bağlantı zaman aşımına uğradı (22 saniye).'
+        ? 'Bağlantı zaman aşımına uğradı (24 saniye).'
         : 'Bağlantıya erişilemedi. Adresi ve internet erişimini kontrol edin.';
     sendJson(res, 422, {error: message});
   } finally {

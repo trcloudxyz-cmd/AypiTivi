@@ -2,6 +2,12 @@ export type MediaCategory = 'live' | 'movie' | 'series';
 
 export type NavFilter = 'all' | MediaCategory | 'favorites' | 'recent';
 
+export interface XtreamCredentials {
+  serverUrl: string;
+  username: string;
+  password: string;
+}
+
 export interface ChannelItem {
   id: string;
   index: number;
@@ -13,8 +19,11 @@ export interface ChannelItem {
   tvgId?: string;
   tvgName?: string;
   qualityLabel?: string;
+  rating?: string;
   streamFormat?: 'hls' | 'mpegts' | 'native';
   seriesTitle?: string;
+  seriesId?: string;
+  isSeriesFolder?: boolean;
   season?: number;
   episode?: number;
 }
@@ -22,8 +31,9 @@ export interface ChannelItem {
 export interface Playlist {
   id: string;
   name: string;
-  sourceType: 'file' | 'url' | 'paste' | 'sample';
+  sourceType: 'file' | 'url' | 'paste' | 'sample' | 'xtream';
   sourceRef?: string;
+  xtreamCredentials?: XtreamCredentials;
   createdAt: number;
   items: ChannelItem[];
 }

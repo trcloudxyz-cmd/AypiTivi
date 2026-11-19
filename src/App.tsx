@@ -22,6 +22,14 @@ const QUICK_TABS: Array<{id: NavFilter; label: string}> = [
   {id: 'favorites', label: 'Favoriler'},
 ];
 
+function getDefaultFilterForItems(items: ChannelItem[]): NavFilter {
+  const stats = computePlaylistStats(items);
+  if (stats.live > 0) return 'live';
+  if (stats.movie > 0) return 'movie';
+  if (stats.series > 0) return 'series';
+  return 'all';
+}
+
 export default function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [activePlaylistId, setActivePlaylistId] = useState<string | null>(null);
@@ -35,12 +43,15 @@ export default function App() {
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentIds, setRecentIds] = useState<string[]>([]);
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
+  const [onDemandActiveChannel, setOnDemandActiveChannel] = useState<ChannelItem | null>(null);
+  const [playbackQueue, setPlaybackQueue] = useState<ChannelItem[] | null>(null);
 
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isTheatreMode, setIsTheatreMode] = useState(false);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const seriesEpisodesCacheRef = useRef<Map<string, ChannelItem[]>>(new Map());
 
   // Hydrate playlists and preferences from IndexedDB / localStorage
   useEffect(() => {
@@ -52,11 +63,14 @@ export default function App() {
       ]);
       if (!mounted) return;
       setPlaylists(loadedPlaylists);
-      const validActive =
-        loadedPlaylists.find((p) => p.id === prefs.activePlaylistId)?.id ??
-        loadedPlaylists[0]?.id ??
+      const validPlaylist =
+        loadedPlaylists.find((p) => p.id === prefs.activePlaylistId) ??
+        loadedPlaylists[0] ??
         null;
-      setActivePlaylistId(validActive);
+      setActivePlaylistId(validPlaylist?.id ?? null);
+      if (validPlaylist) {
+        setActiveFilter(getDefaultFilterForItems(validPlaylist.items));
+      }
       setFavorites(prefs.favorites);
       setRecentIds(prefs.recentIds);
       setIsHydrated(true);
@@ -165,20 +179,37 @@ export default function App() {
     return list;
   }, [navFilteredItems, selectedGroup, searchQuery]);
 
-  const activeChannel = useMemo(
-    () => allItems.find((i) => i.id === activeChannelId) ?? null,
-    [allItems, activeChannelId],
+  const activeChannel = useMemo(() => {
+    if (!activeChannelId) return null;
+    return (
+      allItems.find((i) => i.id === activeChannelId) ??
+      (onDemandActiveChannel?.id === activeChannelId ? onDemandActiveChannel : null)
+    );
+  }, [allItems, activeChannelId, onDemandActiveChannel]);
+
+  const activeQueue = useMemo(
+    () => (playbackQueue && playbackQueue.length > 0 ? playbackQueue : filteredItems),
+    [playbackQueue, filteredItems],
   );
 
   const activeChannelPos = useMemo(() => {
     if (!activeChannel) return -1;
-    return filteredItems.findIndex((i) => i.id === activeChannel.id);
-  }, [filteredItems, activeChannel]);
+    return activeQueue.findIndex((i) => i.id === activeChannel.id);
+  }, [activeQueue, activeChannel]);
 
-  const handlePlayChannel = useCallback((channel: ChannelItem) => {
+  const handlePlayChannel = useCallback((channel: ChannelItem, queue?: ChannelItem[]) => {
     setActiveChannelId(channel.id);
+    setOnDemandActiveChannel(channel);
+    setPlaybackQueue(queue ?? null);
     setRecentIds((prev) => [channel.id, ...prev.filter((id) => id !== channel.id)].slice(0, 40));
     window.scrollTo({top: 0, behavior: 'smooth'});
+  }, []);
+
+  const handleClosePlayer = useCallback(() => {
+    setActiveChannelId(null);
+    setOnDemandActiveChannel(null);
+    setPlaybackQueue(null);
+    setIsTheatreMode(false);
   }, []);
 
   const handleToggleFavorite = useCallback((id: string) => {
@@ -187,6 +218,51 @@ export default function App() {
     );
   }, []);
 
+  const handleFetchSeriesEpisodes = useCallback(
+    async (series: ChannelItem): Promise<ChannelItem[]> => {
+      const cacheKey = `${activePlaylist?.id || 'pl'}_${series.seriesId || series.id}`;
+      const cached = seriesEpisodesCacheRef.current.get(cacheKey);
+      if (cached) return cached;
+
+      const creds = activePlaylist?.xtreamCredentials;
+      if (!creds || !series.seriesId) {
+        throw new Error('Dizi bölümleri için sunucu bilgileri bulunamadı.');
+      }
+
+      const response = await fetch('/api/xtream-login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          serverUrl: creds.serverUrl,
+          username: creds.username,
+          password: creds.password,
+          action: 'series_info',
+          seriesId: series.seriesId,
+          seriesTitle: series.name,
+          seriesGroup: series.group,
+          seriesLogo: series.logo,
+        }),
+      });
+
+      const rawText = await response.text();
+      let data: {episodes?: ChannelItem[]; error?: string} | null = null;
+      try {
+        data = JSON.parse(rawText) as {episodes?: ChannelItem[]; error?: string};
+      } catch {
+        data = null;
+      }
+
+      if (!response.ok || !data?.episodes) {
+        throw new Error(data?.error || 'Dizi bölümleri sunucudan alınamadı.');
+      }
+
+      seriesEpisodesCacheRef.current.set(cacheKey, data.episodes);
+      return data.episodes;
+    },
+    [activePlaylist],
+  );
+
   const handleImportPlaylist = useCallback(async (playlist: Playlist) => {
     await savePlaylist(playlist);
     setPlaylists((prev) => {
@@ -194,10 +270,12 @@ export default function App() {
       return [playlist, ...withoutSame];
     });
     setActivePlaylistId(playlist.id);
-    setActiveFilter('all');
+    setActiveFilter(getDefaultFilterForItems(playlist.items));
     setSelectedGroup('__ALL__');
     setSearchQuery('');
-    setActiveChannelId(playlist.items[0]?.id ?? null);
+    setActiveChannelId(null);
+    setOnDemandActiveChannel(null);
+    setPlaybackQueue(null);
     setIsUploadModalOpen(false);
   }, []);
 
@@ -207,8 +285,14 @@ export default function App() {
       setPlaylists((prev) => {
         const next = prev.filter((p) => p.id !== id);
         if (activePlaylistId === id) {
-          setActivePlaylistId(next[0]?.id ?? null);
+          const nextActive = next[0] ?? null;
+          setActivePlaylistId(nextActive?.id ?? null);
+          if (nextActive) {
+            setActiveFilter(getDefaultFilterForItems(nextActive.items));
+          }
           setActiveChannelId(null);
+          setOnDemandActiveChannel(null);
+          setPlaybackQueue(null);
         }
         return next;
       });
@@ -216,13 +300,19 @@ export default function App() {
     [activePlaylistId],
   );
 
-  const handleSelectPlaylist = useCallback((id: string) => {
-    setActivePlaylistId(id);
-    setActiveFilter('all');
-    setSelectedGroup('__ALL__');
-    setSearchQuery('');
-    setActiveChannelId(null);
-  }, []);
+  const handleSelectPlaylist = useCallback(
+    (id: string) => {
+      const target = playlists.find((p) => p.id === id);
+      setActivePlaylistId(id);
+      setActiveFilter(target ? getDefaultFilterForItems(target.items) : 'all');
+      setSelectedGroup('__ALL__');
+      setSearchQuery('');
+      setActiveChannelId(null);
+      setOnDemandActiveChannel(null);
+      setPlaybackQueue(null);
+    },
+    [playlists],
+  );
 
   const handleResetFilters = useCallback(() => {
     setActiveFilter('all');
@@ -232,15 +322,15 @@ export default function App() {
 
   const handlePrevChannel = useCallback(() => {
     if (activeChannelPos > 0) {
-      handlePlayChannel(filteredItems[activeChannelPos - 1]);
+      handlePlayChannel(activeQueue[activeChannelPos - 1], playbackQueue ?? undefined);
     }
-  }, [activeChannelPos, filteredItems, handlePlayChannel]);
+  }, [activeChannelPos, activeQueue, playbackQueue, handlePlayChannel]);
 
   const handleNextChannel = useCallback(() => {
-    if (activeChannelPos >= 0 && activeChannelPos < filteredItems.length - 1) {
-      handlePlayChannel(filteredItems[activeChannelPos + 1]);
+    if (activeChannelPos >= 0 && activeChannelPos < activeQueue.length - 1) {
+      handlePlayChannel(activeQueue[activeChannelPos + 1], playbackQueue ?? undefined);
     }
-  }, [activeChannelPos, filteredItems, handlePlayChannel]);
+  }, [activeChannelPos, activeQueue, playbackQueue, handlePlayChannel]);
 
   return (
     <div className="flex min-h-screen bg-[#090B0F] text-[#F3F4F6]">
@@ -377,7 +467,7 @@ export default function App() {
                   Canlı TV, Film ve Dizilerinizi Tek Ekranda İzleyin
                 </h1>
                 <p className="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-slate-400 sm:text-base">
-                  M3U/M3U8 yayın listenizi saniyeler içinde yükleyin; içerikleriniz otomatik olarak Canlı TV, Film ve Dizi kategorilerine ayrılsın.
+                  M3U/M3U8 yayın listenizi veya sunucu bilgilerinizi ekleyin; içerikleriniz otomatik olarak Canlı TV, Film ve Dizi kategorilerine ayrılsın.
                 </p>
               </div>
               <UploadPanel onImportPlaylist={handleImportPlaylist} />
@@ -386,19 +476,29 @@ export default function App() {
             <div className="space-y-6">
               {/* Active Video Player */}
               {activeChannel && (
-                <VideoPlayer
-                  channel={activeChannel}
-                  isFavorite={favoritesSet.has(activeChannel.id)}
-                  onToggleFavorite={handleToggleFavorite}
-                  onPrevChannel={handlePrevChannel}
-                  onNextChannel={handleNextChannel}
-                  hasPrev={activeChannelPos > 0}
-                  hasNext={
-                    activeChannelPos >= 0 && activeChannelPos < filteredItems.length - 1
-                  }
-                  isTheatreMode={isTheatreMode}
-                  onToggleTheatreMode={() => setIsTheatreMode((prev) => !prev)}
-                />
+                <div className="space-y-2">
+                  <div className="flex items-center justify-end">
+                    <button
+                      type="button"
+                      onClick={handleClosePlayer}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#10131A] px-3 text-xs font-medium text-slate-300 transition-colors hover:bg-white/[0.06] hover:text-white"
+                    >
+                      <X size={13} />
+                      <span>Oynatıcıyı Kapat</span>
+                    </button>
+                  </div>
+                  <VideoPlayer
+                    channel={activeChannel}
+                    isFavorite={favoritesSet.has(activeChannel.id)}
+                    onToggleFavorite={handleToggleFavorite}
+                    onPrevChannel={handlePrevChannel}
+                    onNextChannel={handleNextChannel}
+                    hasPrev={activeChannelPos > 0}
+                    hasNext={activeChannelPos >= 0 && activeChannelPos < activeQueue.length - 1}
+                    isTheatreMode={isTheatreMode}
+                    onToggleTheatreMode={() => setIsTheatreMode((prev) => !prev)}
+                  />
+                </div>
               )}
 
               {/* Library Header & Quick Filter Tabs */}
@@ -461,6 +561,7 @@ export default function App() {
                 onPlayChannel={handlePlayChannel}
                 onToggleFavorite={handleToggleFavorite}
                 onResetFilters={handleResetFilters}
+                onFetchSeriesEpisodes={handleFetchSeriesEpisodes}
               />
             </div>
           )}

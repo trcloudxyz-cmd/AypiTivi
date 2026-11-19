@@ -6,6 +6,7 @@ interface ChannelThumbnailProps {
   src?: string;
   name: string;
   mediaType: MediaCategory;
+  fit?: 'cover' | 'contain';
   className?: string;
   iconSize?: number;
 }
@@ -14,6 +15,7 @@ export function ChannelThumbnail({
   src,
   name,
   mediaType,
+  fit = 'cover',
   className = '',
   iconSize = 22,
 }: ChannelThumbnailProps) {
@@ -29,14 +31,20 @@ export function ChannelThumbnail({
 
   if (src && !hasError) {
     return (
-      <div className={`relative overflow-hidden bg-[#121620] ${className}`}>
+      <div
+        className={`relative overflow-hidden bg-[#121620] ${
+          fit === 'contain' ? 'flex items-center justify-center p-2.5' : ''
+        } ${className}`}
+      >
         <img
           src={src}
           alt={name}
           referrerPolicy="no-referrer"
           loading="lazy"
           onError={() => setHasError(true)}
-          className="h-full w-full object-cover"
+          className={
+            fit === 'contain' ? 'max-h-full max-w-full object-contain' : 'h-full w-full object-cover'
+          }
         />
       </div>
     );
@@ -48,7 +56,7 @@ export function ChannelThumbnail({
     <div
       className={`relative flex flex-col items-center justify-center overflow-hidden bg-gradient-to-br from-[#161B26] via-[#11151E] to-[#0C0F16] text-slate-400 ${className}`}
     >
-      <FallbackIcon size={iconSize} strokeWidth={1.6} className="text-slate-400/80" />
+      <FallbackIcon size={iconSize} strokeWidth={1.6} className="text-slate-500" />
       {initials && (
         <span className="mt-1 font-display text-[11px] font-semibold tracking-wider text-slate-500">
           {initials}
