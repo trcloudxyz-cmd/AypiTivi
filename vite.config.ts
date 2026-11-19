@@ -4,13 +4,29 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  const isWebos = process.env.WEBOS_BUILD === 'true';
+
   return {
+    base: isWebos ? './' : '/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    build: isWebos
+      ? {
+          outDir: 'dist-webos',
+          emptyOutDir: true,
+          target: 'chrome68',
+          cssTarget: 'chrome68',
+          rollupOptions: {
+            output: {
+              inlineDynamicImports: true,
+            },
+          },
+        }
+      : undefined,
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.

@@ -14,6 +14,7 @@ import {
   savePlaylist,
   savePreferences,
 } from './utils/storage';
+import {apiCredentials, buildApiUrl} from './utils/apiConfig';
 import {isSmartTvBrowser, moveSpatialFocus, type SpatialDirection} from './utils/tvNavigation';
 
 const QUICK_TABS: Array<{id: NavFilter; label: string}> = [
@@ -339,9 +340,9 @@ export default function App() {
         throw new Error('Dizi bölümleri için sunucu bilgileri bulunamadı.');
       }
 
-      const response = await fetch('/api/xtream-login', {
+      const response = await fetch(buildApiUrl('/api/xtream-login'), {
         method: 'POST',
-        credentials: 'include',
+        credentials: apiCredentials(),
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           serverUrl: creds.serverUrl,

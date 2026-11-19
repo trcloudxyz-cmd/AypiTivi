@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import {useCallback, useEffect, useRef, useState} from 'react';
 import type {ChannelItem} from '../types/iptv';
+import {apiCredentials, buildApiUrl, isPackagedWebOsApp} from '../utils/apiConfig';
 import {isSmartTvBrowser} from '../utils/tvNavigation';
 
 interface QualityLevel {
@@ -66,7 +67,10 @@ interface StreamCandidate {
   mode: 'hls' | 'mpegts' | 'flv' | 'native';
 }
 
-function buildStreamCandidates(channel: ChannelItem): StreamCandidate[] {
+function buildStreamCandidates(
+  channel: ChannelItem,
+  preferNativeFirst = false,
+): StreamCandidate[] {
   const rawUrl = channel.url.trim();
   const [pathOnly] = rawUrl.split('?');
   const lowerPath = pathOnly.toLowerCase();
@@ -81,6 +85,30 @@ function buildStreamCandidates(channel: ChannelItem): StreamCandidate[] {
     lowerPath.endsWith('.mkv')
   ) {
     return [{url: rawUrl, mode: 'native'}];
+  }
+
+  // Packaged LG webOS (.ipk on file://) can play http:// streams directly through
+  // TV's hardware <video> element without triggering XHR CORS restrictions.
+  if (preferNativeFirst) {
+    const candidates: StreamCandidate[] = [{url: rawUrl, mode: 'native'}];
+    if (lowerPath.endsWith('.ts')) {
+      const m3u8Url = rawUrl.replace(/\.ts(\?.*)?$/i, '.m3u8$1');
+      candidates.push({url: m3u8Url, mode: 'native'});
+      candidates.push({url: rawUrl, mode: 'mpegts'});
+      candidates.push({url: m3u8Url, mode: 'hls'});
+    } else if (lowerPath.endsWith('.m3u8') || lowerPath.endsWith('.m3u')) {
+      if (channel.mediaType === 'live') {
+        candidates.push({url: rawUrl.replace(/\.m3u8(\?.*)?$/i, '.ts$1'), mode: 'native'});
+      }
+      candidates.push({url: rawUrl, mode: 'hls'});
+    } else if (channel.mediaType === 'live') {
+      candidates.push({url: `${rawUrl}.m3u8`, mode: 'native'});
+      candidates.push({url: rawUrl, mode: 'mpegts'});
+      candidates.push({url: rawUrl, mode: 'hls'});
+    } else {
+      candidates.push({url: rawUrl, mode: 'hls'});
+    }
+    return candidates;
   }
 
   if (channel.streamFormat === 'mpegts' || lowerPath.endsWith('.ts')) {
@@ -166,8 +194,8 @@ async function runProxyDiagnostic(
 ): Promise<string> {
   try {
     const res = await fetch(
-      `/api/proxy-stream?probe=1&url=${encodeURIComponent(targetStreamUrl)}`,
-      {credentials: 'include'},
+      buildApiUrl(`/api/proxy-stream?probe=1&url=${encodeURIComponent(targetStreamUrl)}`),
+      {credentials: apiCredentials()},
     );
     const text = await res.text();
     let data: {ok?: boolean; status?: number; contentType?: string; error?: string} | null = null;
@@ -233,6 +261,7 @@ export function VideoPlayer({
   const hlsRef = useRef<Hls | null>(null);
   const mpegtsRef = useRef<mpegts.Player | null>(null);
   const hideControlsTimer = useRef<number | null>(null);
+  const handleAttemptFailureRef = useRef<((status?: number | null) => void) | null>(null);
 
   const currentChannelKey = channel ? `${channel.id}|${channel.url}` : null;
 
@@ -304,7 +333,8 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video || !channel || playback.channelKey !== currentChannelKey) return;
 
-    const candidates = buildStreamCandidates(channel);
+    const packagedWebOs = isPackagedWebOsApp();
+    const candidates = buildStreamCandidates(channel, packagedWebOs && !useProxy);
     const activeCandidate = candidates[Math.min(attemptIndex, candidates.length - 1)];
     if (!activeCandidate) return;
 
@@ -323,7 +353,7 @@ export function VideoPlayer({
     }
 
     const effectiveUrl = useProxy
-      ? `/api/proxy-stream?url=${encodeURIComponent(activeCandidate.url)}`
+      ? buildApiUrl(`/api/proxy-stream?url=${encodeURIComponent(activeCandidate.url)}`)
       : activeCandidate.url;
 
     const handleAttemptFailure = (statusFromPlayer?: number | null) => {
@@ -366,6 +396,8 @@ export function VideoPlayer({
       });
     };
 
+    handleAttemptFailureRef.current = handleAttemptFailure;
+
     const tryNativePlayback = () => {
       video.src = effectiveUrl;
       video.load();
@@ -388,7 +420,7 @@ export function VideoPlayer({
           type: activeCandidate.mode === 'flv' ? 'flv' : 'mpegts',
           isLive: channel.mediaType === 'live',
           url: effectiveUrl,
-          withCredentials: useProxy,
+          withCredentials: useProxy && !packagedWebOs,
         },
         {
           enableStashBuffer: true,
@@ -420,11 +452,12 @@ export function VideoPlayer({
         enableWorker: !smartTv,
         lowLatencyMode: channel.mediaType === 'live',
         backBufferLength: smartTv ? 30 : 60,
-        xhrSetup: useProxy
-          ? (xhr) => {
-              xhr.withCredentials = true;
-            }
-          : undefined,
+        xhrSetup:
+          useProxy && !packagedWebOs
+            ? (xhr) => {
+                xhr.withCredentials = true;
+              }
+            : undefined,
       });
       hlsRef.current = hls;
 
@@ -478,6 +511,7 @@ export function VideoPlayer({
 
     return () => {
       cancelled = true;
+      handleAttemptFailureRef.current = null;
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -737,6 +771,10 @@ export function VideoPlayer({
           onDurationChange={(e) => setDuration(e.currentTarget.duration)}
           onError={(e) => {
             if (!hlsRef.current && !mpegtsRef.current && e.currentTarget.getAttribute('src')) {
+              if (handleAttemptFailureRef.current) {
+                handleAttemptFailureRef.current(null);
+                return;
+              }
               if (!useProxy) {
                 setPlayback((prev) => ({
                   ...prev,

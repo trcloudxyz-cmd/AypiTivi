@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import {useRef, useState} from 'react';
 import type {ChannelItem, Playlist, XtreamCredentials} from '../types/iptv';
+import {apiCredentials, buildApiUrl} from '../utils/apiConfig';
 import {
   computePlaylistStats,
   createDirectStreamItem,
@@ -149,9 +150,9 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     defaultPlaylistName: string,
   ): Promise<boolean> => {
     setLoadingStatus('Sunucu hesabı doğrulanıyor...');
-    const response = await fetch('/api/xtream-login', {
+    const response = await fetch(buildApiUrl('/api/xtream-login'), {
       method: 'POST',
-      credentials: 'include',
+      credentials: apiCredentials(),
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         serverUrl: creds.serverUrl,
@@ -219,9 +220,9 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
 
     setLoadingStatus('Canlı TV, Filmler ve Diziler yükleniyor...');
     const fetchCategory = async (action: 'live' | 'movie' | 'series'): Promise<ChannelItem[]> => {
-      const res = await fetch('/api/xtream-login', {
+      const res = await fetch(buildApiUrl('/api/xtream-login'), {
         method: 'POST',
-        credentials: 'include',
+        credentials: apiCredentials(),
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           serverUrl: origin,
@@ -305,9 +306,9 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       }
 
       setLoadingStatus('M3U listesi indiriliyor...');
-      const response = await fetch('/api/fetch-m3u', {
+      const response = await fetch(buildApiUrl('/api/fetch-m3u'), {
         method: 'POST',
-        credentials: 'include',
+        credentials: apiCredentials(),
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({url: normalized}),
       });

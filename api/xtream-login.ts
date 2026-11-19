@@ -90,6 +90,9 @@ async function readJsonBody(req: IncomingMessage & {body?: unknown}): Promise<Re
 function sendJson(res: ServerResponse, status: number, payload: unknown) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.end(JSON.stringify(payload));
 }
 
@@ -137,6 +140,16 @@ export default async function handler(
   req: IncomingMessage & {body?: unknown},
   res: ServerResponse,
 ) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
   if (req.method !== 'POST') {
     sendJson(res, 405, {error: 'Method not allowed'});
     return;
