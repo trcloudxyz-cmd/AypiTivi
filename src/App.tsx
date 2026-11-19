@@ -488,6 +488,7 @@ export default function App() {
                     </button>
                   </div>
                   <VideoPlayer
+                    key={activeChannel.id}
                     channel={activeChannel}
                     isFavorite={favoritesSet.has(activeChannel.id)}
                     onToggleFavorite={handleToggleFavorite}

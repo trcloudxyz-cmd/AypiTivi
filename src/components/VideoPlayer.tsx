@@ -146,6 +146,14 @@ function describeUpstreamStatus(status: number | null, usingProxy: boolean): str
     : 'Yayın yüklenemedi (CORS veya ağ hatası). Proxy ile oynatmayı deneyebilirsiniz.';
 }
 
+function defaultNeedsProxy(url?: string): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    window.location.protocol === 'https:' &&
+    Boolean(url?.trim().toLowerCase().startsWith('http://'))
+  );
+}
+
 export function VideoPlayer({
   channel,
   isFavorite,
@@ -163,12 +171,39 @@ export function VideoPlayer({
   const mpegtsRef = useRef<mpegts.Player | null>(null);
   const hideControlsTimer = useRef<number | null>(null);
 
+  const currentChannelKey = channel ? `${channel.id}|${channel.url}` : null;
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [useProxy, setUseProxy] = useState(false);
-  const [attemptIndex, setAttemptIndex] = useState(0);
-  const [reloadNonce, setReloadNonce] = useState(0);
+  const [playback, setPlayback] = useState(() => ({
+    channelKey: currentChannelKey,
+    useProxy: defaultNeedsProxy(channel?.url),
+    attemptIndex: 0,
+    reloadNonce: 0,
+  }));
+
+  const useProxy = playback.useProxy;
+  const attemptIndex = playback.attemptIndex;
+  const reloadNonce = playback.reloadNonce;
+
+  const setUseProxy = useCallback((next: boolean) => {
+    setPlayback((prev) => ({...prev, useProxy: next}));
+  }, []);
+
+  const setAttemptIndex = useCallback((next: number | ((prev: number) => number)) => {
+    setPlayback((prev) => ({
+      ...prev,
+      attemptIndex: typeof next === 'function' ? next(prev.attemptIndex) : next,
+    }));
+  }, []);
+
+  const setReloadNonce = useCallback((next: number | ((prev: number) => number)) => {
+    setPlayback((prev) => ({
+      ...prev,
+      reloadNonce: typeof next === 'function' ? next(prev.reloadNonce) : next,
+    }));
+  }, []);
 
   const [volume, setVolume] = useState(0.85);
   const [isMuted, setIsMuted] = useState(false);
@@ -183,14 +218,14 @@ export function VideoPlayer({
   const [selectedAudio, setSelectedAudio] = useState<number>(0);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
 
-  // Reset proxy mode & attempt queue when switching channels
+  // Sync playback state when switching channels (race-free)
   useEffect(() => {
-    const needsMixedContentProxy =
-      typeof window !== 'undefined' &&
-      window.location.protocol === 'https:' &&
-      Boolean(channel?.url?.toLowerCase().startsWith('http://'));
-    setUseProxy(needsMixedContentProxy);
-    setAttemptIndex(0);
+    setPlayback({
+      channelKey: currentChannelKey,
+      useProxy: defaultNeedsProxy(channel?.url),
+      attemptIndex: 0,
+      reloadNonce: 0,
+    });
     setErrorMessage(null);
     setQualities([]);
     setSelectedQuality(-1);
@@ -198,12 +233,12 @@ export function VideoPlayer({
     setShowSettingsMenu(false);
     setCurrentTime(0);
     setDuration(0);
-  }, [channel?.id, channel?.url]);
+  }, [currentChannelKey, channel?.url]);
 
   // Attach HLS / MPEG-TS / Native stream with automatic format fallback
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !channel) return;
+    if (!video || !channel || playback.channelKey !== currentChannelKey) return;
 
     const candidates = buildStreamCandidates(channel);
     const activeCandidate = candidates[Math.min(attemptIndex, candidates.length - 1)];
@@ -227,11 +262,10 @@ export function VideoPlayer({
       ? `/api/proxy-stream?url=${encodeURIComponent(activeCandidate.url)}`
       : activeCandidate.url;
 
-    const handleAttemptFailure = async () => {
+    const handleAttemptFailure = (statusFromPlayer?: number | null) => {
       if (cancelled || handledFailure) return;
       handledFailure = true;
 
-      // Clean up current player instances immediately
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -243,40 +277,25 @@ export function VideoPlayer({
 
       // 1. Try next stream candidate format (.m3u8 <-> .ts)
       if (attemptIndex + 1 < candidates.length) {
-        setAttemptIndex((idx) => idx + 1);
+        setPlayback((prev) => ({
+          ...prev,
+          attemptIndex: prev.attemptIndex + 1,
+        }));
         return;
       }
 
       // 2. If direct HTTPS stream failed (likely CORS), auto-switch to proxy
       if (!useProxy) {
-        setAttemptIndex(0);
-        setUseProxy(true);
+        setPlayback((prev) => ({
+          ...prev,
+          useProxy: true,
+          attemptIndex: 0,
+        }));
         return;
       }
 
-      // 3. All candidates exhausted — diagnose upstream HTTP status
-      let upstreamStatus: number | null = null;
-      const probeController = new AbortController();
-      const probeTimer = window.setTimeout(() => probeController.abort(), 5000);
-      try {
-        const probeRes = await fetch(effectiveUrl, {
-          method: 'GET',
-          credentials: 'include',
-          signal: probeController.signal,
-        });
-        const hdrStatus = probeRes.headers.get('X-Proxy-Upstream-Status');
-        upstreamStatus = hdrStatus ? Number(hdrStatus) : probeRes.status;
-        probeController.abort();
-      } catch {
-        // Ignore probe errors
-      } finally {
-        window.clearTimeout(probeTimer);
-      }
-
-      if (!cancelled) {
-        setIsBuffering(false);
-        setErrorMessage(describeUpstreamStatus(upstreamStatus, useProxy));
-      }
+      setIsBuffering(false);
+      setErrorMessage(describeUpstreamStatus(statusFromPlayer ?? null, useProxy));
     };
 
     const tryNativePlayback = () => {
@@ -288,7 +307,7 @@ export function VideoPlayer({
           if (!cancelled) setIsBuffering(false);
         })
         .catch(() => {
-          // Wait for media events or onError
+          // Wait for playing or onError
         });
     };
 
@@ -320,8 +339,12 @@ export function VideoPlayer({
           // Wait for playing or error event
         });
 
-      player.on(mpegts.Events.ERROR, () => {
-        void handleAttemptFailure();
+      player.on(mpegts.Events.ERROR, (_errType, _errDetail, info) => {
+        const httpCode =
+          info && typeof info === 'object' && 'code' in info && typeof info.code === 'number'
+            ? info.code
+            : null;
+        handleAttemptFailure(httpCode);
       });
     } else if (activeCandidate.mode === 'hls' && Hls.isSupported()) {
       const hls = new Hls({
@@ -372,7 +395,11 @@ export function VideoPlayer({
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             hls.recoverMediaError();
           } else {
-            void handleAttemptFailure();
+            const statusCode =
+              typeof data.response?.code === 'number' && data.response.code > 0
+                ? data.response.code
+                : null;
+            handleAttemptFailure(statusCode);
           }
         }
       });
@@ -393,7 +420,7 @@ export function VideoPlayer({
       video.removeAttribute('src');
       video.load();
     };
-  }, [channel, useProxy, attemptIndex, reloadNonce]);
+  }, [channel, currentChannelKey, playback.channelKey, useProxy, attemptIndex, reloadNonce]);
 
   // Keep volume synced
   useEffect(() => {
@@ -557,11 +584,22 @@ export function VideoPlayer({
           onDurationChange={(e) => setDuration(e.currentTarget.duration)}
           onError={(e) => {
             if (!hlsRef.current && !mpegtsRef.current && e.currentTarget.getAttribute('src')) {
+              if (!useProxy) {
+                setPlayback((prev) => ({
+                  ...prev,
+                  useProxy: true,
+                  attemptIndex: 0,
+                }));
+                return;
+              }
               setIsBuffering(false);
+              const lowerUrl = channel.url.split('?')[0].toLowerCase();
+              const isNonNativeContainer =
+                lowerUrl.endsWith('.mkv') || lowerUrl.endsWith('.avi') || lowerUrl.endsWith('.flv');
               setErrorMessage(
-                useProxy
-                  ? 'Yayın formatı tarayıcı tarafından desteklenmiyor veya kaynak yanıt vermiyor.'
-                  : 'Video akışı oynatılamadı. CORS engeli varsa proxy ile deneyebilirsiniz.',
+                isNonNativeContainer
+                  ? 'Bu video dosyası (.mkv/.avi) tarayıcının doğrudan oynatamadığı bir ses/görüntü kodeği (ör. AC3/HEVC) içeriyor olabilir.'
+                  : 'Yayın formatı tarayıcı tarafından desteklenmiyor veya kaynak yanıt vermiyor.',
               );
             }
           }}
