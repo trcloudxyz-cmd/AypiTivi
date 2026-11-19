@@ -2,8 +2,10 @@ import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
 import {
   AlertTriangle,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Maximize,
   Minimize,
   Monitor,
@@ -104,6 +106,13 @@ function buildStreamCandidates(channel: ChannelItem): StreamCandidate[] {
         url: rawUrl.replace(/\.m3u8(\?.*)?$/i, '.ts$1'),
         mode: 'mpegts',
       });
+      const extensionlessXtream = rawUrl.replace(/\/live\/([^/]+)\/([^/]+)\/(\d+)\.m3u8(\?.*)?$/i, '/$1/$2/$3$4');
+      if (extensionlessXtream !== rawUrl) {
+        candidates.push({
+          url: extensionlessXtream,
+          mode: 'mpegts',
+        });
+      }
     }
     return candidates;
   }
@@ -118,8 +127,8 @@ function buildStreamCandidates(channel: ChannelItem): StreamCandidate[] {
   }
 
   return [
-    {url: rawUrl, mode: 'hls'},
     {url: rawUrl, mode: 'native'},
+    {url: rawUrl, mode: 'hls'},
   ];
 }
 
@@ -144,6 +153,55 @@ function describeUpstreamStatus(status: number | null, usingProxy: boolean): str
   return usingProxy
     ? 'Yayın kaynağına proxy üzerinden de ulaşılamadı. Bağlantı çevrimdışı veya sunucu proxy IP adresini engelliyor olabilir.'
     : 'Yayın yüklenemedi (CORS veya ağ hatası). Proxy ile oynatmayı deneyebilirsiniz.';
+}
+
+async function runProxyDiagnostic(
+  targetStreamUrl: string,
+  usingProxy: boolean,
+  fallbackStatus: number | null,
+): Promise<string> {
+  try {
+    const res = await fetch(
+      `/api/proxy-stream?probe=1&url=${encodeURIComponent(targetStreamUrl)}`,
+      {credentials: 'include'},
+    );
+    const text = await res.text();
+    let data: {ok?: boolean; status?: number; contentType?: string; error?: string} | null = null;
+    try {
+      data = JSON.parse(text) as {ok?: boolean; status?: number; contentType?: string; error?: string};
+    } catch {
+      data = null;
+    }
+
+    if (!data) {
+      if (res.status === 404) {
+        return 'Yayın proxy servisi bulunamadı (HTTP 404). Vercel üzerinde çalışıyorsanız son sürümü yeniden deploy edin.';
+      }
+      return `Proxy servisi beklenmeyen bir yanıt döndü (HTTP ${res.status}). Sayfayı önizleme penceresinde yenileyip tekrar deneyin.`;
+    }
+
+    if (data.ok) {
+      const lowerUrl = targetStreamUrl.split('?')[0].toLowerCase();
+      const ct = (data.contentType || '').toLowerCase();
+      if (
+        lowerUrl.endsWith('.mkv') ||
+        lowerUrl.endsWith('.avi') ||
+        ct.includes('matroska') ||
+        ct.includes('x-msvideo')
+      ) {
+        return 'Kaynak sunucu erişilebilir (HTTP 200), ancak bu .mkv/.avi dosyası tarayıcının doğrudan oynatamadığı bir kodek (HEVC/AC3) içeriyor olabilir.';
+      }
+      return 'Kaynak sunucu yanıt verdi (HTTP 200) ancak tarayıcı bu yayın akışını çözemedi. Bağlantıyı kopyalayıp VLC ile açabilirsiniz.';
+    }
+
+    if (data.status === 502 && data.error) {
+      return `IPTV sunucusuna proxy üzerinden ulaşılamadı (${data.error}). Sunucu bulut IP adreslerini engelliyor veya çevrimdışı olabilir.`;
+    }
+
+    return describeUpstreamStatus(data.status ?? fallbackStatus, usingProxy);
+  } catch {
+    return describeUpstreamStatus(fallbackStatus, usingProxy);
+  }
 }
 
 function defaultNeedsProxy(url?: string): boolean {
@@ -176,6 +234,7 @@ export function VideoPlayer({
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [copiedLink, setCopiedLink] = useState(false);
   const [playback, setPlayback] = useState(() => ({
     channelKey: currentChannelKey,
     useProxy: defaultNeedsProxy(channel?.url),
@@ -294,8 +353,12 @@ export function VideoPlayer({
         return;
       }
 
-      setIsBuffering(false);
-      setErrorMessage(describeUpstreamStatus(statusFromPlayer ?? null, useProxy));
+      void runProxyDiagnostic(channel.url, useProxy, statusFromPlayer ?? null).then((diagMsg) => {
+        if (!cancelled) {
+          setIsBuffering(false);
+          setErrorMessage(diagMsg);
+        }
+      });
     };
 
     const tryNativePlayback = () => {
@@ -592,15 +655,10 @@ export function VideoPlayer({
                 }));
                 return;
               }
-              setIsBuffering(false);
-              const lowerUrl = channel.url.split('?')[0].toLowerCase();
-              const isNonNativeContainer =
-                lowerUrl.endsWith('.mkv') || lowerUrl.endsWith('.avi') || lowerUrl.endsWith('.flv');
-              setErrorMessage(
-                isNonNativeContainer
-                  ? 'Bu video dosyası (.mkv/.avi) tarayıcının doğrudan oynatamadığı bir ses/görüntü kodeği (ör. AC3/HEVC) içeriyor olabilir.'
-                  : 'Yayın formatı tarayıcı tarafından desteklenmiyor veya kaynak yanıt vermiyor.',
-              );
+              void runProxyDiagnostic(channel.url, useProxy, null).then((diagMsg) => {
+                setIsBuffering(false);
+                setErrorMessage(diagMsg);
+              });
             }
           }}
           className="h-full w-full cursor-pointer object-contain"
@@ -661,6 +719,19 @@ export function VideoPlayer({
                     <span>Proxysiz Dene</span>
                   </button>
                 ) : null}
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(channel.url).then(() => {
+                      setCopiedLink(true);
+                      window.setTimeout(() => setCopiedLink(false), 2000);
+                    });
+                  }}
+                  className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-white/10 whitespace-nowrap shrink-0"
+                >
+                  {copiedLink ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                  <span>{copiedLink ? 'Kopyalandı' : 'Bağlantıyı Kopyala'}</span>
+                </button>
               </div>
             </div>
           </div>

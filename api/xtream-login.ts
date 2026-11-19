@@ -364,6 +364,7 @@ export default async function handler(
   // Default action ('auth'): Validate credentials via player_api.php, or fallback to get.php
   let accountInfo: {status?: string; expDate?: string; maxConnections?: string} | undefined;
   let playerApiSupported = false;
+  let resolvedServerOrigin = baseOrigin;
 
   try {
     const authController = new AbortController();
@@ -375,6 +376,12 @@ export default async function handler(
           status?: string;
           exp_date?: string | null;
           max_connections?: string;
+        };
+        server_info?: {
+          url?: string;
+          port?: string | number;
+          https_port?: string | number;
+          server_protocol?: string;
         };
       }>(apiBase, authController.signal);
 
@@ -396,6 +403,20 @@ export default async function handler(
           expDate: authJson.user_info.exp_date || undefined,
           maxConnections: authJson.user_info.max_connections,
         };
+
+        const si = authJson.server_info;
+        if (
+          si?.server_protocol?.toLowerCase() === 'https' &&
+          si.url &&
+          !isBlockedHostname(si.url)
+        ) {
+          const httpsPort = si.https_port ? String(si.https_port).trim() : '443';
+          const portSuffix = httpsPort && httpsPort !== '443' ? `:${httpsPort}` : '';
+          const candidate = extractXtreamBaseUrl(`https://${si.url}${portSuffix}`);
+          if (candidate) {
+            resolvedServerOrigin = candidate.toString().replace(/\/+$/, '');
+          }
+        }
       }
     } finally {
       clearTimeout(authTimer);
@@ -407,7 +428,7 @@ export default async function handler(
   if (playerApiSupported) {
     sendJson(res, 200, {
       mode: 'xtream',
-      serverOrigin: baseOrigin,
+      serverOrigin: resolvedServerOrigin,
       accountInfo,
     });
     return;

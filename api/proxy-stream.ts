@@ -88,6 +88,19 @@ function looksLikeM3u8Buffer(buf: Uint8Array): boolean {
   return sample.startsWith('#EXTM3U');
 }
 
+function inferVideoContentType(rawContentType: string, finalUrl: string): string {
+  const lowerCt = rawContentType.toLowerCase();
+  if (lowerCt && !lowerCt.includes('octet-stream')) {
+    return rawContentType;
+  }
+  const pathOnly = finalUrl.split('?')[0].toLowerCase();
+  if (pathOnly.endsWith('.mp4') || pathOnly.endsWith('.m4v')) return 'video/mp4';
+  if (pathOnly.endsWith('.webm')) return 'video/webm';
+  if (pathOnly.endsWith('.ts')) return 'video/mp2t';
+  if (pathOnly.endsWith('.mkv')) return 'video/x-matroska';
+  return rawContentType || 'application/octet-stream';
+}
+
 function waitForDrainOrClose(res: ServerResponse): Promise<void> {
   if (res.writableEnded || res.destroyed) {
     return Promise.resolve();
@@ -129,16 +142,23 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
 
   const reqUrl = new URL(req.url || '/', 'http://localhost');
   const rawUrl = reqUrl.searchParams.get('url') || '';
+  const isProbe = reqUrl.searchParams.get('probe') === '1';
   const targetUrl = validateRemoteUrl(rawUrl);
 
   if (!targetUrl) {
+    if (isProbe) {
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ok: false, error: 'Geçersiz yayın adresi'}));
+      return;
+    }
     res.statusCode = 400;
     res.end('Invalid stream URL');
     return;
   }
 
   const controller = new AbortController();
-  const connectTimeout = setTimeout(() => controller.abort(), 20000);
+  const connectTimeout = setTimeout(() => controller.abort(), isProbe ? 8000 : 20000);
   res.on('close', () => {
     if (!res.writableFinished) {
       controller.abort();
@@ -149,7 +169,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     const baseHeaders: Record<string, string> = {
       Accept: '*/*',
     };
-    if (typeof req.headers.range === 'string') {
+    if (!isProbe && typeof req.headers.range === 'string') {
       baseHeaders.Range = req.headers.range;
     }
 
@@ -178,9 +198,32 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     clearTimeout(connectTimeout);
 
     if (!upstream) {
+      if (isProbe) {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ok: false, status: 502, error: 'Upstream connection failed'}));
+        return;
+      }
       res.statusCode = 502;
       res.setHeader('X-Proxy-Upstream-Status', '502');
       res.end('Upstream connection failed');
+      return;
+    }
+
+    if (isProbe) {
+      const ct = upstream.headers.get('content-type') || '';
+      const finalUrl = upstream.url || targetUrl.toString();
+      await upstream.body?.cancel().catch(() => {});
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(
+        JSON.stringify({
+          ok: upstream.ok || upstream.status === 206,
+          status: upstream.status,
+          contentType: ct,
+          finalUrl,
+        }),
+      );
       return;
     }
 
@@ -193,9 +236,10 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       return;
     }
 
-    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-    const lowerCt = contentType.toLowerCase();
+    const rawContentType = upstream.headers.get('content-type') || 'application/octet-stream';
     const finalUrl = upstream.url || targetUrl.toString();
+    const contentType = inferVideoContentType(rawContentType, finalUrl);
+    const lowerCt = contentType.toLowerCase();
     const isExplicitM3u8Ct = lowerCt.includes('mpegurl') || lowerCt.includes('m3u');
     const isVideoCt =
       lowerCt.startsWith('video/') ||
@@ -275,11 +319,24 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     if (!res.writableEnded) {
       res.end();
     }
-  } catch {
+  } catch (err) {
+    const errCause =
+      err && typeof err === 'object' && 'cause' in err && err.cause && typeof err.cause === 'object'
+        ? (err.cause as {code?: string; message?: string})
+        : null;
+    const errDetail = errCause?.code || errCause?.message || (err instanceof Error ? err.message : 'Bağlantı hatası');
+
+    if (isProbe) {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ok: false, status: 502, error: errDetail}));
+      return;
+    }
+
     if (!res.headersSent) {
       res.statusCode = 502;
       res.setHeader('X-Proxy-Upstream-Status', '502');
-      res.end('Stream proxy error');
+      res.end(`Stream proxy error: ${errDetail}`);
     } else if (!res.writableEnded) {
       res.end();
     }

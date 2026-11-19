@@ -198,6 +198,15 @@ export default function App() {
   }, [activeQueue, activeChannel]);
 
   const handlePlayChannel = useCallback((channel: ChannelItem, queue?: ChannelItem[]) => {
+    if (
+      typeof document.hasStorageAccess === 'function' &&
+      typeof document.requestStorageAccess === 'function'
+    ) {
+      void document
+        .hasStorageAccess()
+        .then((has) => (!has ? document.requestStorageAccess() : undefined))
+        .catch(() => {});
+    }
     setActiveChannelId(channel.id);
     setOnDemandActiveChannel(channel);
     setPlaybackQueue(queue ?? null);
