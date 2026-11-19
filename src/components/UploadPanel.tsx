@@ -1,4 +1,14 @@
-import {CheckCircle2, FileText, Link2, Sparkles, Upload, X} from 'lucide-react';
+import {
+  CheckCircle2,
+  Eye,
+  EyeOff,
+  FileText,
+  Link2,
+  Server,
+  Sparkles,
+  Upload,
+  X,
+} from 'lucide-react';
 import {useRef, useState} from 'react';
 import type {Playlist} from '../types/iptv';
 import {
@@ -15,9 +25,26 @@ interface UploadPanelProps {
   isModal?: boolean;
 }
 
-type ImportTab = 'file' | 'url' | 'paste';
+type ImportTab = 'file' | 'url' | 'server' | 'paste';
 
 const LOCAL_VIDEO_EXTENSIONS = ['.ts', '.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
+const DIRECT_STREAM_EXTENSIONS = ['.ts', '.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv'];
+
+async function parseJsonResponse<T>(response: Response): Promise<{data: T | null; rawText: string}> {
+  const rawText = await response.text();
+  try {
+    return {data: JSON.parse(rawText) as T, rawText};
+  } catch {
+    return {data: null, rawText};
+  }
+}
+
+function normalizeUrlInput(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `http://${trimmed}`;
+}
 
 export function UploadPanel({onImportPlaylist, onClose, isModal = false}: UploadPanelProps) {
   const [activeTab, setActiveTab] = useState<ImportTab>('file');
@@ -25,11 +52,25 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
   const [playlistName, setPlaylistName] = useState('');
   const [urlInput, setUrlInput] = useState('');
   const [pasteInput, setPasteInput] = useState('');
+
+  // Server (Xtream) login fields
+  const [serverUsername, setServerUsername] = useState('');
+  const [serverPassword, setServerPassword] = useState('');
+  const [serverUrl, setServerUrl] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [accountMeta, setAccountMeta] = useState<string | null>(null);
+
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingPlaylist, setPendingPlaylist] = useState<Playlist | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const resetFormFeedback = () => {
+    setError(null);
+    setPendingPlaylist(null);
+    setAccountMeta(null);
+  };
 
   const buildPendingPlaylist = (
     items: Playlist['items'],
@@ -70,9 +111,33 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
   };
 
   const fetchOrAddUrl = async (rawUrl: string) => {
-    const trimmed = rawUrl.trim();
-    if (!trimmed) {
+    const normalized = normalizeUrlInput(rawUrl);
+    if (!normalized) {
       setError('Lütfen geçerli bir M3U, M3U8 veya TS bağlantısı girin.');
+      return;
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(normalized);
+    } catch {
+      setError('Geçersiz bağlantı adresi. Örnek: https://ornek.com/liste.m3u');
+      return;
+    }
+
+    const derivedName = parsedUrl.hostname.replace(/^www\./, '') || 'Yayın Bağlantısı';
+    const lowerPath = parsedUrl.pathname.toLowerCase();
+
+    // Direct binary stream URLs (.ts, .mp4, etc.) do not need M3U text fetching
+    if (DIRECT_STREAM_EXTENSIONS.some((ext) => lowerPath.endsWith(ext))) {
+      setError(null);
+      const item = createDirectStreamItem(
+        normalized,
+        playlistName.trim() || undefined,
+        1,
+        lowerPath.endsWith('.ts') || lowerPath.endsWith('.flv') ? 'mpegts' : 'native',
+      );
+      buildPendingPlaylist([item], item.name, 'url', normalized);
       return;
     }
 
@@ -82,43 +147,145 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       const response = await fetch('/api/fetch-m3u', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({url: trimmed}),
+        body: JSON.stringify({url: normalized}),
       });
-      const data = (await response.json()) as {
+
+      const {data} = await parseJsonResponse<{
         isDirectStream?: boolean;
         content?: string;
         finalUrl?: string;
         error?: string;
-      };
+      }>(response);
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Bağlantı yüklenemedi.');
+      // If backend API returned JSON properly
+      if (data) {
+        if (!response.ok) {
+          throw new Error(data.error || 'Bağlantı yüklenemedi.');
+        }
+
+        if (data.isDirectStream) {
+          const item = createDirectStreamItem(
+            data.finalUrl || normalized,
+            playlistName.trim() || undefined,
+          );
+          buildPendingPlaylist([item], item.name, 'url', normalized);
+          return;
+        }
+
+        const content = data.content || '';
+        if (isHlsStreamManifest(content)) {
+          const item = createDirectStreamItem(
+            data.finalUrl || normalized,
+            playlistName.trim() || undefined,
+            1,
+            'hls',
+          );
+          buildPendingPlaylist([item], item.name, 'url', normalized);
+          return;
+        }
+
+        processM3uContent(content, derivedName, 'url', normalized);
+        return;
       }
 
-      let derivedName = 'Yayın Bağlantısı';
+      // Fallback when server proxy endpoint returned HTML/non-JSON (e.g. static preview or gateway error)
       try {
-        const parsedUrl = new URL(trimmed);
-        derivedName = parsedUrl.hostname.replace(/^www\./, '');
+        const directRes = await fetch(normalized);
+        if (!directRes.ok) {
+          throw new Error(`Sunucu ${directRes.status} yanıtı döndürdü.`);
+        }
+        const directText = await directRes.text();
+        if (isHlsStreamManifest(directText)) {
+          const item = createDirectStreamItem(normalized, playlistName.trim() || undefined, 1, 'hls');
+          buildPendingPlaylist([item], item.name, 'url', normalized);
+          return;
+        }
+        processM3uContent(directText, derivedName, 'url', normalized);
       } catch {
-        // Fallback name
+        throw new Error(
+          'Bağlantıdan liste çekilemedi. Sunucu adresinin erişilebilir olduğundan emin olun veya M3U dosyasını indirip yükleyin.',
+        );
       }
-
-      if (data.isDirectStream) {
-        const item = createDirectStreamItem(data.finalUrl || trimmed, playlistName.trim() || undefined);
-        buildPendingPlaylist([item], item.name, 'url', trimmed);
-        return;
-      }
-
-      const content = data.content || '';
-      if (isHlsStreamManifest(content)) {
-        const item = createDirectStreamItem(data.finalUrl || trimmed, playlistName.trim() || undefined);
-        buildPendingPlaylist([item], item.name, 'url', trimmed);
-        return;
-      }
-
-      processM3uContent(content, derivedName, 'url', trimmed);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Bağlantıdan içerik yüklenemedi.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleServerLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanUser = serverUsername.trim();
+    const cleanPass = serverPassword.trim();
+    const cleanServer = normalizeUrlInput(serverUrl);
+
+    if (!cleanUser || !cleanPass || !cleanServer) {
+      setError('Lütfen Kullanıcı Adı, Şifre ve Url / Server Link alanlarını doldurun.');
+      return;
+    }
+
+    let parsedHost = 'IPTV Sunucusu';
+    try {
+      parsedHost = new URL(cleanServer).hostname.replace(/^www\./, '') || parsedHost;
+    } catch {
+      setError('Geçerli bir Sunucu URL adresi girin (örn: http://sunucu.com:8080).');
+      return;
+    }
+
+    setError(null);
+    setAccountMeta(null);
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('/api/xtream-login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          serverUrl: cleanServer,
+          username: cleanUser,
+          password: cleanPass,
+        }),
+      });
+
+      const {data} = await parseJsonResponse<{
+        content?: string;
+        serverOrigin?: string;
+        error?: string;
+        accountInfo?: {
+          status?: string;
+          expDate?: string;
+          maxConnections?: string;
+        };
+      }>(response);
+
+      if (!data) {
+        throw new Error(
+          'Sunucu giriş servisine ulaşılamadı. Bağlantınızı kontrol edip tekrar deneyin.',
+        );
+      }
+
+      if (!response.ok || !data.content) {
+        throw new Error(data.error || 'Sunucuya giriş yapılamadı.');
+      }
+
+      if (data.accountInfo?.expDate) {
+        const expTimestamp = Number(data.accountInfo.expDate);
+        if (Number.isFinite(expTimestamp) && expTimestamp > 0) {
+          const formattedDate = new Date(expTimestamp * 1000).toLocaleDateString('tr-TR');
+          setAccountMeta(`Durum: Aktif · Bitiş: ${formattedDate}`);
+        } else {
+          setAccountMeta('Durum: Aktif');
+        }
+      }
+
+      processM3uContent(
+        data.content,
+        playlistName.trim() || parsedHost,
+        'url',
+        data.serverOrigin || cleanServer,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Sunucu girişi başarısız oldu.');
     } finally {
       setIsLoading(false);
     }
@@ -162,7 +329,6 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       return;
     }
 
-    // If user pasted a single URL (e.g., https://.../playlist.m3u or https://.../stream.ts), handle it smartly
     const nonEmptyLines = trimmed
       .split(/\r?\n/)
       .map((l) => l.trim())
@@ -198,10 +364,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="font-display text-xl font-semibold tracking-tight text-white sm:text-2xl">
-            Yayın Listesi veya Link Ekle
+            Yayın Listesi veya Sunucu Ekle
           </h2>
           <p className="mt-1.5 text-sm text-slate-400">
-            M3U/M3U8/TS dosyanızı yükleyin, doğrudan dosya/yayın bağlantısını yapıştırın ya da içerik listesini ekleyin.
+            M3U/M3U8/TS dosyası yükleyin, doğrudan link yapıştırın veya sunucu bilgilerinizle giriş yapın.
           </p>
         </div>
         {isModal && onClose && (
@@ -217,73 +383,85 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       </div>
 
       {/* Mode Tabs */}
-      <div className="mt-6 flex items-center gap-1 rounded-xl border border-white/[0.06] bg-[#0B0D12] p-1">
+      <div className="mt-6 grid grid-cols-2 gap-1 rounded-xl border border-white/[0.06] bg-[#0B0D12] p-1 sm:grid-cols-4">
         <button
           type="button"
           onClick={() => {
             setActiveTab('file');
-            setError(null);
-            setPendingPlaylist(null);
+            resetFormFeedback();
           }}
-          className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 sm:text-sm ${
+          className={`flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'file'
               ? 'bg-[#1A202C] text-white'
               : 'text-slate-400 hover:text-slate-200'
           }`}
         >
-          <Upload size={15} />
+          <Upload size={14} />
           <span>Dosya Yükle</span>
         </button>
         <button
           type="button"
           onClick={() => {
             setActiveTab('url');
-            setError(null);
-            setPendingPlaylist(null);
+            resetFormFeedback();
           }}
-          className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 sm:text-sm ${
+          className={`flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'url'
               ? 'bg-[#1A202C] text-white'
               : 'text-slate-400 hover:text-slate-200'
           }`}
         >
-          <Link2 size={15} />
-          <span>Link Yapıştır (.m3u / .ts)</span>
+          <Link2 size={14} />
+          <span>Link (.m3u / .ts)</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTab('server');
+            resetFormFeedback();
+          }}
+          className={`flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+            activeTab === 'server'
+              ? 'bg-[#1A202C] text-white'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Server size={14} />
+          <span>Server Girişi</span>
         </button>
         <button
           type="button"
           onClick={() => {
             setActiveTab('paste');
-            setError(null);
-            setPendingPlaylist(null);
+            resetFormFeedback();
           }}
-          className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 sm:text-sm ${
+          className={`flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'paste'
               ? 'bg-[#1A202C] text-white'
               : 'text-slate-400 hover:text-slate-200'
           }`}
         >
-          <FileText size={15} />
-          <span>Çoklu Link / Metin</span>
+          <FileText size={14} />
+          <span>Metin / Çoklu Link</span>
         </button>
       </div>
 
-      {/* Optional Playlist Name */}
+      {/* Playlist Name (shared across all tabs) */}
       <div className="mt-5">
         <label htmlFor="playlist-name-input" className="block text-xs font-medium text-slate-300">
-          Liste veya Yayın Adı (İsteğe Bağlı)
+          Liste Adı {activeTab === 'server' ? '(İsteğe Bağlı)' : '(İsteğe Bağlı)'}
         </label>
         <input
           id="playlist-name-input"
           type="text"
           value={playlistName}
           onChange={(e) => setPlaylistName(e.target.value)}
-          placeholder="Örn: Ev TV Listem veya Haber HD"
+          placeholder="Örn: Ev TV Listem"
           className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 text-sm text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
         />
       </div>
 
-      {/* Tab Content */}
+      {/* Tab 1: File Upload */}
       {!pendingPlaylist && activeTab === 'file' && (
         <div
           onDragOver={(e) => {
@@ -334,6 +512,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         </div>
       )}
 
+      {/* Tab 2: URL / Link */}
       {!pendingPlaylist && activeTab === 'url' && (
         <form onSubmit={handleUrlFetch} className="mt-5 space-y-4">
           <div>
@@ -342,7 +521,8 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             </label>
             <input
               id="m3u-url-input"
-              type="url"
+              type="text"
+              inputMode="url"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
               placeholder="https://ornek.com/liste.m3u veya https://ornek.com/yayin.ts"
@@ -363,6 +543,89 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         </form>
       )}
 
+      {/* Tab 3: Server Login (Xtream Codes) */}
+      {!pendingPlaylist && activeTab === 'server' && (
+        <form onSubmit={handleServerLogin} className="mt-4 space-y-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label
+                htmlFor="server-username-input"
+                className="block text-xs font-medium text-slate-300"
+              >
+                Kullanıcı Adı
+              </label>
+              <input
+                id="server-username-input"
+                type="text"
+                autoComplete="username"
+                value={serverUsername}
+                onChange={(e) => setServerUsername(e.target.value)}
+                placeholder="kullanici_adi"
+                required
+                className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 text-sm text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="server-password-input"
+                className="block text-xs font-medium text-slate-300"
+              >
+                Şifre
+              </label>
+              <div className="relative mt-1.5">
+                <input
+                  id="server-password-input"
+                  type={showPassword ? 'text' : 'password'}
+                  autoComplete="current-password"
+                  value={serverPassword}
+                  onChange={(e) => setServerPassword(e.target.value)}
+                  placeholder="••••••••"
+                  required
+                  className="h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] pr-10 pl-3.5 text-sm text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  aria-label={showPassword ? 'Şifreyi gizle' : 'Şifreyi göster'}
+                  className="absolute top-1/2 right-2.5 -translate-y-1/2 rounded p-1 text-slate-400 hover:bg-white/[0.06] hover:text-white"
+                >
+                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="server-url-input" className="block text-xs font-medium text-slate-300">
+              Url / Server Link
+            </label>
+            <input
+              id="server-url-input"
+              type="text"
+              inputMode="url"
+              value={serverUrl}
+              onChange={(e) => setServerUrl(e.target.value)}
+              placeholder="http://sunucu.ornek.com:8080"
+              required
+              className="mt-1.5 h-10 w-full rounded-lg border border-white/[0.08] bg-[#0B0D12] px-3.5 font-mono text-xs text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none sm:text-sm"
+            />
+            <p className="mt-1.5 text-xs text-slate-500">
+              Xtream Codes API veya standart IPTV sunucu adresinizi port numarasıyla birlikte girin.
+            </p>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
+          >
+            {isLoading ? 'Sunucuya Bağlanılıyor...' : 'Sunucudan Giriş Yap'}
+          </button>
+        </form>
+      )}
+
+      {/* Tab 4: Paste Content / Multi-Link */}
       {!pendingPlaylist && activeTab === 'paste' && (
         <form onSubmit={handlePasteSubmit} className="mt-5 space-y-4">
           <div>
@@ -408,6 +671,9 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
                 <span aria-hidden="true">·</span>
                 <span>{pendingStats.series.toLocaleString('tr-TR')} Dizi</span>
               </p>
+              {accountMeta && (
+                <p className="mt-1 font-mono text-xs text-emerald-300">{accountMeta}</p>
+              )}
             </div>
           </div>
 
@@ -421,7 +687,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
             </button>
             <button
               type="button"
-              onClick={() => setPendingPlaylist(null)}
+              onClick={() => {
+                setPendingPlaylist(null);
+                setAccountMeta(null);
+              }}
               className="inline-flex h-10 items-center justify-center rounded-lg border border-white/[0.1] px-4 text-sm font-medium text-slate-300 transition-colors hover:bg-white/[0.05] whitespace-nowrap shrink-0"
             >
               Başka Kaynak Seç
