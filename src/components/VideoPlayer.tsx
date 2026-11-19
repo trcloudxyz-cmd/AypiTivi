@@ -93,9 +93,13 @@ export function VideoPlayer({
   const [selectedAudio, setSelectedAudio] = useState<number>(0);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
 
-  // Reset proxy mode when switching channels
+  // Reset proxy mode when switching channels (auto-proxy http:// streams on https:// pages)
   useEffect(() => {
-    setUseProxy(false);
+    const needsMixedContentProxy =
+      typeof window !== 'undefined' &&
+      window.location.protocol === 'https:' &&
+      Boolean(channel?.url?.toLowerCase().startsWith('http://'));
+    setUseProxy(needsMixedContentProxy);
     setErrorMessage(null);
     setQualities([]);
     setSelectedQuality(-1);
@@ -103,7 +107,7 @@ export function VideoPlayer({
     setShowSettingsMenu(false);
     setCurrentTime(0);
     setDuration(0);
-  }, [channel?.id]);
+  }, [channel?.id, channel?.url]);
 
   // Attach HLS / MPEG-TS / Native stream
   useEffect(() => {

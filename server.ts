@@ -107,6 +107,31 @@ async function startServer() {
     return parsed;
   }
 
+  const IPTV_USER_AGENTS = [
+    'VLC/3.0.20 LibVLC/3.0.20',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  ];
+
+  async function fetchIptv(url: string, signal: AbortSignal): Promise<Response> {
+    let lastRes: Response | null = null;
+    for (const ua of IPTV_USER_AGENTS) {
+      const res = await fetch(url, {
+        signal,
+        headers: {
+          'User-Agent': ua,
+          Accept: '*/*',
+        },
+        redirect: 'follow',
+      });
+      if (res.ok || (res.status !== 403 && res.status !== 406 && res.status !== 503)) {
+        return res;
+      }
+      await res.body?.cancel().catch(() => {});
+      lastRes = res;
+    }
+    return lastRes!;
+  }
+
   // Fetch remote M3U/M3U8 playlist bypassing browser CORS
   app.post('/api/fetch-m3u', async (req, res) => {
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url : '';
@@ -126,17 +151,10 @@ async function startServer() {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    const timeout = setTimeout(() => controller.abort(), 22000);
 
     try {
-      const upstream = await fetch(targetUrl.toString(), {
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
-          Accept: '*/*',
-        },
-        redirect: 'follow',
-      });
+      const upstream = await fetchIptv(targetUrl.toString(), controller.signal);
 
       if (!upstream.ok) {
         res.status(422).json({
@@ -276,11 +294,7 @@ async function startServer() {
       const m3uTimer = setTimeout(() => m3uController.abort(), 25000);
       try {
         const m3uUrl = `${baseOrigin}/get.php?username=${encodedUser}&password=${encodedPass}&type=m3u_plus&output=${fmt}`;
-        const m3uRes = await fetch(m3uUrl, {
-          signal: m3uController.signal,
-          headers: requestHeaders,
-          redirect: 'follow',
-        });
+        const m3uRes = await fetchIptv(m3uUrl, m3uController.signal);
 
         if (m3uRes.ok) {
           const contentLengthHeader = m3uRes.headers.get('content-length');
@@ -505,6 +519,15 @@ async function startServer() {
     } finally {
       clearTimeout(connectTimeout);
     }
+  });
+
+  app.get('/api/health', (_req, res) => {
+    res.json({ok: true});
+  });
+
+  // Ensure unmatched /api/* or JSON errors never return HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({error: 'API uç noktası bulunamadı.'});
   });
 
   if (process.env.NODE_ENV !== 'production') {

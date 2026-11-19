@@ -46,6 +46,20 @@ function normalizeUrlInput(raw: string): string {
   return `http://${trimmed}`;
 }
 
+async function ensureIframeStorageAccess() {
+  try {
+    if (
+      typeof document.hasStorageAccess === 'function' &&
+      typeof document.requestStorageAccess === 'function' &&
+      !(await document.hasStorageAccess())
+    ) {
+      await document.requestStorageAccess();
+    }
+  } catch {
+    // Ignore if browser blocks or doesn't require storage access
+  }
+}
+
 export function UploadPanel({onImportPlaylist, onClose, isModal = false}: UploadPanelProps) {
   const [activeTab, setActiveTab] = useState<ImportTab>('file');
   const [isDragging, setIsDragging] = useState(false);
@@ -128,7 +142,6 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     const derivedName = parsedUrl.hostname.replace(/^www\./, '') || 'Yayın Bağlantısı';
     const lowerPath = parsedUrl.pathname.toLowerCase();
 
-    // Direct binary stream URLs (.ts, .mp4, etc.) do not need M3U text fetching
     if (DIRECT_STREAM_EXTENSIONS.some((ext) => lowerPath.endsWith(ext))) {
       setError(null);
       const item = createDirectStreamItem(
@@ -144,20 +157,21 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     setError(null);
     setIsLoading(true);
     try {
+      await ensureIframeStorageAccess();
       const response = await fetch('/api/fetch-m3u', {
         method: 'POST',
+        credentials: 'include',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({url: normalized}),
       });
 
-      const {data} = await parseJsonResponse<{
+      const {data, rawText} = await parseJsonResponse<{
         isDirectStream?: boolean;
         content?: string;
         finalUrl?: string;
         error?: string;
       }>(response);
 
-      // If backend API returned JSON properly
       if (data) {
         if (!response.ok) {
           throw new Error(data.error || 'Bağlantı yüklenemedi.');
@@ -188,7 +202,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         return;
       }
 
-      // Fallback when server proxy endpoint returned HTML/non-JSON (e.g. static preview or gateway error)
+      // Fallback when backend API wasn't reachable (e.g. static preview or blocked iframe cookie)
       try {
         const directRes = await fetch(normalized);
         if (!directRes.ok) {
@@ -202,8 +216,13 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         }
         processM3uContent(directText, derivedName, 'url', normalized);
       } catch {
+        const snippet = rawText.replace(/<[^>]+>/g, ' ').trim().slice(0, 80);
+        const hint =
+          window.location.protocol === 'https:' && normalized.startsWith('http://')
+            ? 'HTTP bağlantıları tarayıcıda güvenlik nedeniyle yalnızca sunucu vekili aktifken çekilebilir; alternatif olarak M3U dosyasını cihazınıza indirip "Dosya Yükle" sekmesinden ekleyebilirsiniz.'
+            : 'Bağlantıdan liste çekilemedi. M3U dosyasını indirip "Dosya Yükle" sekmesinden yükleyebilirsiniz.';
         throw new Error(
-          'Bağlantıdan liste çekilemedi. Sunucu adresinin erişilebilir olduğundan emin olun veya M3U dosyasını indirip yükleyin.',
+          `${hint}${snippet ? ` (Servis yanıtı: HTTP ${response.status} — ${snippet})` : ''}`,
         );
       }
     } catch (err) {
@@ -237,8 +256,10 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
     setIsLoading(true);
 
     try {
+      await ensureIframeStorageAccess();
       const response = await fetch('/api/xtream-login', {
         method: 'POST',
+        credentials: 'include',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           serverUrl: cleanServer,
@@ -247,7 +268,7 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
         }),
       });
 
-      const {data} = await parseJsonResponse<{
+      const {data, rawText} = await parseJsonResponse<{
         content?: string;
         serverOrigin?: string;
         error?: string;
@@ -259,8 +280,29 @@ export function UploadPanel({onImportPlaylist, onClose, isModal = false}: Upload
       }>(response);
 
       if (!data) {
+        // If serverUrl is HTTPS and CORS allows, try direct get.php fallback
+        if (cleanServer.startsWith('https://')) {
+          try {
+            const baseOrigin = cleanServer.replace(/\/+$/, '');
+            const directM3u = await fetch(
+              `${baseOrigin}/get.php?username=${encodeURIComponent(cleanUser)}&password=${encodeURIComponent(cleanPass)}&type=m3u_plus&output=m3u8`,
+            );
+            if (directM3u.ok) {
+              const text = await directM3u.text();
+              if (text.includes('#EXTINF') || text.includes('#EXTM3U')) {
+                processM3uContent(text, playlistName.trim() || parsedHost, 'url', baseOrigin);
+                return;
+              }
+            }
+          } catch {
+            // Fall through to diagnostic error
+          }
+        }
+        const snippet = rawText.replace(/<[^>]+>/g, ' ').trim().slice(0, 80);
         throw new Error(
-          'Sunucu giriş servisine ulaşılamadı. Bağlantınızı kontrol edip tekrar deneyin.',
+          `Sunucu giriş servisine ulaşılamadı (HTTP ${response.status}${
+            snippet ? ` — ${snippet}` : ''
+          }). Uygulamayı geliştirme/önizleme penceresinde açtığınızdan veya M3U dosyasını "Dosya Yükle" ile eklediğinizden emin olun.`,
         );
       }
 
